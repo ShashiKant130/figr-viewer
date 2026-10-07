@@ -5,10 +5,13 @@
 //   hello   { url }                         sent until the host answers with "init"
 //   zoom    { x, y, deltaY, deltaMode }     Ctrl/Cmd + wheel over the page
 //   key     { key, shiftKey }               a host shortcut pressed while the page had focus
+//   hover   { epoch, target }               target: { name, rect } in page viewport px, or null
 //
 // host -> agent  { source: "figr-host", type, ...payload }
-//   init    { mode }
-//   mode    { mode }                        "select" | "interact"
+//   init        { mode, hoverEpoch }
+//   mode        { mode }                    "select" | "interact"
+//   clearHover  { epoch }                   the host dropped the hover (pan, zoom, mode change);
+//                                           stay quiet until the pointer moves again
 (() => {
   if (window.parent === window) return;
   const script = document.currentScript;
@@ -43,10 +46,15 @@
       case "init":
         connected = true;
         clearInterval(helloTimer);
+        hoverEpoch = typeof msg.hoverEpoch === "number" ? msg.hoverEpoch : 0;
         setMode(msg.mode);
         break;
       case "mode":
         setMode(msg.mode);
+        break;
+      case "clearHover":
+        if (typeof msg.epoch === "number") hoverEpoch = msg.epoch;
+        suppressHover();
         break;
     }
   });
@@ -64,7 +72,13 @@
     if (next !== "select" && next !== "interact") return;
     mode = next;
     selectSheet.disabled = mode !== "select";
-    if (mode === "select") blurActiveElement();
+    if (mode === "select") {
+      blurActiveElement();
+      if (pointer) startHoverLoop();
+    } else {
+      stopHoverLoop();
+      setHover(null);
+    }
   }
 
   function blurActiveElement() {
@@ -117,6 +131,7 @@
     (event) => {
       if (!event.ctrlKey && !event.metaKey) return;
       event.preventDefault();
+      suppressHover();
       send("zoom", {
         x: event.clientX,
         y: event.clientY,
@@ -155,6 +170,113 @@
         if (!INTERACT_SHORTCUTS.has(key) || isEditable(event.target)) return;
       }
       send("key", { key: event.key, shiftKey: event.shiftKey });
+    },
+    true,
+  );
+
+  // ---- Hover (Select mode) -------------------------------------------------
+  // The element under the pointer is re-measured every frame while the pointer is in the page,
+  // so the outline follows page scroll, nested scroll areas, resizes and re-renders. Only
+  // changes are sent.
+
+  let pointer = null; // { x, y } in this page's viewport px, or null when outside
+  let hover = null; // last target sent: { name, x, y, width, height }
+  let hoverEpoch = 0;
+  let suppressed = false;
+  let rafId = 0;
+
+  function nameOf(el) {
+    const dataName = el.getAttribute("data-name");
+    if (dataName) return dataName;
+    const tag = el.tagName.toLowerCase();
+    if (el.classList.length > 0) return `${tag}.${el.classList[0]}`;
+    if (el.id) return `${tag}#${el.id}`;
+    return tag;
+  }
+
+  function elementAt(x, y) {
+    const el = document.elementFromPoint(x, y);
+    if (!el || el === document.documentElement || el === document.body) return null;
+    return el;
+  }
+
+  function sameTarget(a, b) {
+    return (
+      a.name === b.name &&
+      Math.abs(a.x - b.x) < 0.01 &&
+      Math.abs(a.y - b.y) < 0.01 &&
+      Math.abs(a.width - b.width) < 0.01 &&
+      Math.abs(a.height - b.height) < 0.01
+    );
+  }
+
+  function setHover(next) {
+    if (next === null ? hover === null : hover !== null && sameTarget(hover, next)) return;
+    hover = next;
+    send("hover", {
+      epoch: hoverEpoch,
+      target: next && {
+        name: next.name,
+        rect: { x: next.x, y: next.y, width: next.width, height: next.height },
+      },
+    });
+  }
+
+  function measureHover() {
+    const el = elementAt(pointer.x, pointer.y);
+    if (el) {
+      const r = el.getBoundingClientRect();
+      setHover({ name: nameOf(el), x: r.x, y: r.y, width: r.width, height: r.height });
+    } else {
+      setHover(null);
+    }
+  }
+
+  function hoverTick() {
+    rafId = 0;
+    if (mode !== "select" || !pointer || suppressed) return;
+    measureHover();
+    rafId = requestAnimationFrame(hoverTick);
+  }
+
+  function startHoverLoop() {
+    if (!rafId && connected) rafId = requestAnimationFrame(hoverTick);
+  }
+
+  function stopHoverLoop() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = 0;
+  }
+
+  /** The host already cleared its copy, so forget ours without sending anything. */
+  function suppressHover() {
+    suppressed = true;
+    hover = null;
+    stopHoverLoop();
+  }
+
+  function pointerLeft() {
+    pointer = null;
+    stopHoverLoop();
+    setHover(null);
+  }
+
+  window.addEventListener(
+    "pointermove",
+    (event) => {
+      pointer = { x: event.clientX, y: event.clientY };
+      suppressed = false;
+      if (mode !== "select" || !connected) return;
+      measureHover();
+      startHoverLoop();
+    },
+    true,
+  );
+  document.documentElement.addEventListener("mouseleave", pointerLeft);
+  window.addEventListener(
+    "pointerout",
+    (event) => {
+      if (!event.relatedTarget) pointerLeft();
     },
     true,
   );

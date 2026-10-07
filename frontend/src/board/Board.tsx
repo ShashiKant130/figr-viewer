@@ -8,6 +8,7 @@ import {
 } from "react";
 import { useStore } from "../lib/store";
 import { wheelDeltaToPixels } from "../lib/dom";
+import { Overlay } from "../overlay/Overlay";
 import {
   cameraStore,
   fitToContent,
@@ -36,6 +37,10 @@ export function Board() {
 
   const screenList = screens.status === "ready" ? screens.screens : null;
   const slots = useMemo(() => screenList?.map((_, i) => slotFor(i)) ?? [], [screenList]);
+  const slotsById = useMemo(
+    () => new Map(screenList?.map((screen, i) => [screen.id, slots[i]] as const)),
+    [screenList, slots],
+  );
 
   useLayoutEffect(() => {
     if (!screenList) return;
@@ -121,6 +126,8 @@ export function Board() {
           <Preview key={screen.id} screen={screen} slot={slots[i]} />
         ))}
       </div>
+
+      <Overlay slots={slotsById} />
 
       {screens.status === "loading" && <div className="board-message">Loading screens…</div>}
       {screens.status === "error" && (

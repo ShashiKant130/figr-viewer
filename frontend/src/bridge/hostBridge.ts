@@ -1,17 +1,28 @@
 import { PAGES_ORIGIN, PREVIEW_WIDTH } from "../config";
-import { zoomAtClient } from "../board/camera";
+import { onCameraMotion, zoomAtClient } from "../board/camera";
 import { handleShortcut } from "../keyboard";
 import { createStore } from "../lib/store";
 import { wheelDeltaToPixels } from "../lib/dom";
 import { modeStore, type Mode } from "../modes";
+import { hoverStore, type PageRect } from "../overlay/hoverStore";
 
 // Messages exchanged with public/agent.js; see the protocol comment at the top of that file.
 type AgentMessage =
   | { source: "figr-agent"; session: string; type: "hello"; url: string }
   | { source: "figr-agent"; session: string; type: "zoom"; x: number; y: number; deltaY: number; deltaMode: number }
-  | { source: "figr-agent"; session: string; type: "key"; key: string; shiftKey: boolean };
+  | { source: "figr-agent"; session: string; type: "key"; key: string; shiftKey: boolean }
+  | {
+      source: "figr-agent";
+      session: string;
+      type: "hover";
+      epoch: number;
+      target: { name: string; rect: PageRect } | null;
+    };
 
-type HostMessage = { type: "init"; mode: Mode } | { type: "mode"; mode: Mode };
+type HostMessage =
+  | { type: "init"; mode: Mode; hoverEpoch: number }
+  | { type: "mode"; mode: Mode }
+  | { type: "clearHover"; epoch: number };
 
 type Peer = {
   screenId: string;
@@ -19,6 +30,8 @@ type Peer = {
   /** Changes every time the page (re)loads; messages from any other session are stale. */
   session: string | null;
   url: string | null;
+  /** Bumped on every host-side hover clear; hover messages stamped with an older epoch are stale. */
+  hoverEpoch: number;
 };
 
 export type PeerStatus = "connecting" | "connected";
@@ -38,14 +51,28 @@ function setStatus(screenId: string, status: PeerStatus | null) {
 }
 
 export function registerPreview(screenId: string, iframe: HTMLIFrameElement): () => void {
-  const peer: Peer = { screenId, iframe, session: null, url: null };
+  const peer: Peer = { screenId, iframe, session: null, url: null, hoverEpoch: 0 };
   peers.set(screenId, peer);
   setStatus(screenId, "connecting");
   return () => {
     if (peers.get(screenId) !== peer) return;
     peers.delete(screenId);
     setStatus(screenId, null);
+    dropHoverFor(screenId);
   };
+}
+
+function dropHoverFor(screenId: string) {
+  if (hoverStore.get()?.screenId === screenId) hoverStore.set(null);
+}
+
+/** Clears the board's hover and tells the page it came from to stay quiet until the next move. */
+export function clearHover() {
+  const hover = hoverStore.get();
+  if (!hover) return;
+  hoverStore.set(null);
+  const peer = peers.get(hover.screenId);
+  if (peer?.session) post(peer, { type: "clearHover", epoch: ++peer.hoverEpoch });
 }
 
 function post(peer: Peer, message: HostMessage) {
@@ -80,7 +107,8 @@ function onMessage(event: MessageEvent) {
     // A new session on a known iframe means the page navigated or reloaded.
     peer.session = msg.session;
     peer.url = msg.url;
-    post(peer, { type: "init", mode: modeStore.get() });
+    dropHoverFor(peer.screenId);
+    post(peer, { type: "init", mode: modeStore.get(), hoverEpoch: peer.hoverEpoch });
     setStatus(peer.screenId, "connected");
     return;
   }
@@ -98,7 +126,27 @@ function onMessage(event: MessageEvent) {
     case "key":
       handleShortcut({ key: msg.key, shiftKey: msg.shiftKey });
       break;
+    case "hover":
+      onHover(peer, msg.epoch, msg.target);
+      break;
   }
+}
+
+function isPageRect(value: unknown): value is PageRect {
+  if (typeof value !== "object" || value === null) return false;
+  const r = value as Record<string, unknown>;
+  return [r.x, r.y, r.width, r.height].every((n) => typeof n === "number" && Number.isFinite(n));
+}
+
+function onHover(peer: Peer, epoch: number, target: { name: string; rect: PageRect } | null) {
+  if (epoch !== peer.hoverEpoch || modeStore.get() !== "select") return;
+  if (target === null) {
+    dropHoverFor(peer.screenId);
+    return;
+  }
+  if (typeof target.name !== "string" || !isPageRect(target.rect)) return;
+  // Replacing the store value is what keeps a single hover across the whole board.
+  hoverStore.set({ screenId: peer.screenId, name: target.name, rect: target.rect });
 }
 
 let installed = false;
@@ -108,8 +156,10 @@ export function installHostBridge() {
   window.addEventListener("message", onMessage);
   modeStore.subscribe(() => {
     const mode = modeStore.get();
+    clearHover();
     for (const peer of peers.values()) {
       if (peer.session) post(peer, { type: "mode", mode });
     }
   });
+  onCameraMotion(clearHover);
 }
