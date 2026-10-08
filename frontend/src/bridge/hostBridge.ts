@@ -19,21 +19,54 @@ type AgentMessage = AgentEnvelope &
     | { type: "hello"; url: string }
     | { type: "zoom"; x: number; y: number; deltaY: number; deltaMode: number }
     | { type: "key"; key: string; shiftKey: boolean }
-    | { type: "hover"; epoch: number; target: { name: string; rect: PageRect } | null }
+    | { type: "hover"; epoch: number; target: unknown }
     | { type: "pick"; seq: number; shiftKey: boolean; target: unknown }
     | { type: "navigated"; seq: number; from: string; target: unknown }
     | { type: "selectionRects"; rects: Record<string, unknown> }
     | { type: "selectionRemoved"; ids: unknown[] }
+    | TreeMessage
   );
+
+/** Layers-tree traffic, validated by the layers module rather than here. */
+export type TreeMessage = {
+  type: "childrenResult" | "revealResult" | "searchResult" | "treeUpdate";
+  [field: string]: unknown;
+};
+
+const TREE_MESSAGE_TYPES = new Set(["childrenResult", "revealResult", "searchResult", "treeUpdate"]);
 
 export type NavigateDirection = "firstChild" | "parent" | "next" | "prev";
 
-type HostMessage =
+export type HostMessage =
   | { type: "init"; mode: Mode; hoverEpoch: number }
   | { type: "mode"; mode: Mode }
   | { type: "clearHover"; epoch: number }
   | { type: "selection"; ids: string[]; seq: number }
-  | { type: "navigate"; from: string; direction: NavigateDirection };
+  | { type: "navigate"; from: string; direction: NavigateDirection }
+  | { type: "children"; req: number; id: string }
+  | { type: "reveal"; req: number; id: string }
+  | { type: "search"; req: number; query: string }
+  | { type: "hoverNode"; id: string | null }
+  | { type: "pickId"; id: string; shiftKey: boolean };
+
+type TreeHandlers = {
+  onMessage(screenId: string, message: TreeMessage): void;
+  /** The preview's page (re)loaded; ids from before mean nothing now. */
+  onSession(screenId: string): void;
+};
+
+let treeHandlers: TreeHandlers | null = null;
+export function setTreeHandlers(handlers: TreeHandlers) {
+  treeHandlers = handlers;
+}
+
+/** Returns false if the preview's page isn't connected. */
+export function sendToPreview(screenId: string, message: HostMessage): boolean {
+  const peer = peers.get(screenId);
+  if (!peer?.session) return false;
+  post(peer, message);
+  return true;
+}
 
 type Peer = {
   screenId: string;
@@ -133,10 +166,21 @@ function onMessage(event: MessageEvent) {
     );
     post(peer, { type: "init", mode: modeStore.get(), hoverEpoch: peer.hoverEpoch });
     setStatus(peer.screenId, "connected");
+    treeHandlers?.onSession(peer.screenId);
     return;
   }
 
   if (msg.session !== peer.session) return;
+
+  if (TREE_MESSAGE_TYPES.has(msg.type)) {
+    const tree = msg as TreeMessage;
+    if (tree.type === "treeUpdate" && Array.isArray(tree.removed)) {
+      const hover = hoverStore.get();
+      if (hover?.screenId === peer.screenId && tree.removed.includes(hover.id)) hoverStore.set(null);
+    }
+    treeHandlers?.onMessage(peer.screenId, tree);
+    return;
+  }
 
   switch (msg.type) {
     case "zoom": {
@@ -173,15 +217,17 @@ function isPageRect(value: unknown): value is PageRect {
   return [r.x, r.y, r.width, r.height].every((n) => typeof n === "number" && Number.isFinite(n));
 }
 
-function onHover(peer: Peer, epoch: number, target: { name: string; rect: PageRect } | null) {
+function onHover(peer: Peer, epoch: number, target: unknown) {
   if (epoch !== peer.hoverEpoch || modeStore.get() !== "select") return;
   if (target === null) {
     dropHoverFor(peer.screenId);
     return;
   }
-  if (typeof target.name !== "string" || !isPageRect(target.rect)) return;
+  const t = parseTarget(target);
+  const path = (target as { path?: unknown }).path;
+  if (!t || !Array.isArray(path) || !path.every((id) => typeof id === "string")) return;
   // Replacing the store value is what keeps a single hover across the whole board.
-  hoverStore.set({ screenId: peer.screenId, name: target.name, rect: target.rect });
+  hoverStore.set({ screenId: peer.screenId, id: t.id, path, name: t.name, rect: t.rect });
 }
 
 // ---- Selection ---------------------------------------------------------------

@@ -25,9 +25,7 @@ export function Overlay({ slots }: Props) {
   const hoverSlot = hover ? slots.get(hover.screenId) : undefined;
   // The selection outline already marks this element; a second outline would only add noise.
   const hoverIsSelected =
-    hover !== null &&
-    hover.screenId === selection.screenId &&
-    selected.some((el) => el.name === hover.name && sameRect(el.rect, hover.rect));
+    hover !== null && hover.screenId === selection.screenId && hover.id in selection.elements;
 
   if (selected.length === 0 && (!hover || !hoverSlot || hoverIsSelected)) return null;
 
@@ -55,14 +53,6 @@ export function Overlay({ slots }: Props) {
   );
 }
 
-function sameRect(a: PageRect, b: PageRect) {
-  return (
-    Math.abs(a.x - b.x) < 0.5 &&
-    Math.abs(a.y - b.y) < 0.5 &&
-    Math.abs(a.width - b.width) < 0.5 &&
-    Math.abs(a.height - b.height) < 0.5
-  );
-}
 
 function PreviewClip({
   slot,

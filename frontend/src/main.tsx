@@ -3,9 +3,11 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { installHostBridge } from "./bridge/hostBridge";
 import { handleShortcut, installHostShortcuts } from "./keyboard";
+import { installLayers } from "./layers/layers";
 import "./styles.css";
 
 installHostBridge({ onKey: handleShortcut });
+installLayers();
 installHostShortcuts();
 
 // Ctrl/Cmd + wheel must never zoom the browser tab, even over the toolbar or panels.

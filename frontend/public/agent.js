@@ -5,12 +5,20 @@
 //   hello   { url }                         sent until the host answers with "init"
 //   zoom    { x, y, deltaY, deltaMode }     Ctrl/Cmd + wheel over the page
 //   key     { key, shiftKey }               a host shortcut pressed while the page had focus
-//   hover   { epoch, target }               target: { name, rect } in page viewport px, or null
-//   pick    { seq, shiftKey, target }       a click in Select mode; target: { id, name, rect } or
-//                                           null for the page background
+//   hover   { epoch, target }               target: { id, path, name, rect } or null; path is
+//                                           the ids from the top-level element down to id
+//   pick    { seq, shiftKey, target }       a click in Select mode (or a "pickId"); target:
+//                                           { id, name, rect } or null for the page background
 //   navigated { seq, from, target }         answer to "navigate"; target null means no move
 //   selectionRects   { rects }              { [id]: rect } for selected elements that moved
 //   selectionRemoved { ids }                selected elements that no longer exist
+//   childrenResult { req, id, nodes }       nodes: [{ id, name, hasChildren }] or null
+//   revealResult   { req, id, path, lists } lists: { [parentId]: nodes } for every level of path
+//   searchResult   { req, nodes, matches, truncated }
+//                                           nodes: [{ id, name, hasChildren, parent }] in
+//                                           document order, matches plus their ancestors
+//   treeUpdate     { removed, changed }     changed: [{ id, hasChildren, children? }];
+//                                           children only for parents the host has loaded
 //
 // host -> agent  { source: "figr-host", type, ...payload }
 //   init        { mode, hoverEpoch }
@@ -19,8 +27,13 @@
 //                                           stay quiet until the pointer moves again
 //   selection   { ids, seq }                the host's selection in this page, as of agent seq
 //   navigate    { from, direction }         "firstChild" | "parent" | "next" | "prev"
+//   children    { req, id }                 id "root" means <body>
+//   reveal      { req, id }
+//   search      { req, query }
+//   hoverNode   { id }                      a layers row is hovered (null: no longer)
+//   pickId      { id, shiftKey }            a layers row was clicked
 //
-// Element ids are only meaningful within one session (one page load).
+// Element ids are only meaningful within one session (one page load). "root" is <body>.
 (() => {
   if (window.parent === window) return;
   const script = document.currentScript;
@@ -73,6 +86,23 @@
       case "navigate":
         if (typeof msg.from === "string") navigateFrom(msg.from, msg.direction);
         break;
+      case "children":
+        if (typeof msg.req === "number" && typeof msg.id === "string") answerChildren(msg.req, msg.id);
+        break;
+      case "reveal":
+        if (typeof msg.req === "number" && typeof msg.id === "string") answerReveal(msg.req, msg.id);
+        break;
+      case "search":
+        if (typeof msg.req === "number" && typeof msg.query === "string") {
+          answerSearch(msg.req, msg.query);
+        }
+        break;
+      case "hoverNode":
+        hoverNode(typeof msg.id === "string" ? msg.id : null);
+        break;
+      case "pickId":
+        if (typeof msg.id === "string") pickById(msg.id, msg.shiftKey === true);
+        break;
     }
   });
 
@@ -91,7 +121,7 @@
     selectSheet.disabled = mode !== "select";
     if (mode === "select") {
       blurActiveElement();
-      if (pointer) startHoverLoop();
+      if (pointer || pinnedId) startHoverLoop();
     } else {
       stopHoverLoop();
       setHover(null);
@@ -204,122 +234,14 @@
     true,
   );
 
-  // ---- Hover (Select mode) -------------------------------------------------
-  // The element under the pointer is re-measured every frame while the pointer is in the page,
-  // so the outline follows page scroll, nested scroll areas, resizes and re-renders. Only
-  // changes are sent.
-
-  let pointer = null; // { x, y } in this page's viewport px, or null when outside
-  let hover = null; // last target sent: { name, x, y, width, height }
-  let hoverEpoch = 0;
-  let suppressed = false;
-  let rafId = 0;
-
-  function nameOf(el) {
-    const dataName = el.getAttribute("data-name");
-    if (dataName) return dataName;
-    const tag = el.tagName.toLowerCase();
-    if (el.classList.length > 0) return `${tag}.${el.classList[0]}`;
-    if (el.id) return `${tag}#${el.id}`;
-    return tag;
-  }
-
-  function elementAt(x, y) {
-    const el = document.elementFromPoint(x, y);
-    if (!el || el === document.documentElement || el === document.body) return null;
-    return el;
-  }
-
-  function sameTarget(a, b) {
-    return (
-      a.name === b.name &&
-      Math.abs(a.x - b.x) < 0.01 &&
-      Math.abs(a.y - b.y) < 0.01 &&
-      Math.abs(a.width - b.width) < 0.01 &&
-      Math.abs(a.height - b.height) < 0.01
-    );
-  }
-
-  function setHover(next) {
-    if (next === null ? hover === null : hover !== null && sameTarget(hover, next)) return;
-    hover = next;
-    send("hover", {
-      epoch: hoverEpoch,
-      target: next && {
-        name: next.name,
-        rect: { x: next.x, y: next.y, width: next.width, height: next.height },
-      },
-    });
-  }
-
-  function measureHover() {
-    const el = elementAt(pointer.x, pointer.y);
-    if (el) {
-      const r = el.getBoundingClientRect();
-      setHover({ name: nameOf(el), x: r.x, y: r.y, width: r.width, height: r.height });
-    } else {
-      setHover(null);
-    }
-  }
-
-  function hoverTick() {
-    rafId = 0;
-    if (mode !== "select" || !pointer || suppressed) return;
-    measureHover();
-    rafId = requestAnimationFrame(hoverTick);
-  }
-
-  function startHoverLoop() {
-    if (!rafId && connected) rafId = requestAnimationFrame(hoverTick);
-  }
-
-  function stopHoverLoop() {
-    if (rafId) cancelAnimationFrame(rafId);
-    rafId = 0;
-  }
-
-  /** The host already cleared its copy, so forget ours without sending anything. */
-  function suppressHover() {
-    suppressed = true;
-    hover = null;
-    stopHoverLoop();
-  }
-
-  function pointerLeft() {
-    pointer = null;
-    stopHoverLoop();
-    setHover(null);
-  }
-
-  window.addEventListener(
-    "pointermove",
-    (event) => {
-      pointer = { x: event.clientX, y: event.clientY };
-      suppressed = false;
-      if (mode !== "select" || !connected) return;
-      measureHover();
-      startHoverLoop();
-    },
-    true,
-  );
-  document.documentElement.addEventListener("mouseleave", pointerLeft);
-  window.addEventListener(
-    "pointerout",
-    (event) => {
-      if (!event.relatedTarget) pointerLeft();
-    },
-    true,
-  );
-
-  // ---- Selection -----------------------------------------------------------
-  // The host owns the selection; the agent keeps the selected elements behind opaque ids,
-  // reports their boxes whenever they change and reports when they stop existing.
+  // ---- Element registry ----------------------------------------------------
+  // Every element the host hears about (layers rows, hover, selection) gets one opaque id.
   //
-  // When the page replaces a selected node (e.g. an innerHTML rebuild), the agent looks for
-  // its successor using a description recorded at selection time: the nearest element with a
-  // unique data-key or id, then a path of steps from it that were each unique among their
-  // siblings. Anything that can't be found unambiguously is dropped, so the selection never
-  // moves to a different element; unkeyed rows in a rebuilt list are dropped this way.
+  // When the page replaces a node (e.g. an innerHTML rebuild), its id moves to the successor
+  // found with a recipe recorded at registration: the nearest element with a unique data-key or
+  // id, then a path of steps from it that were each unique among their siblings. Anything that
+  // can't be found unambiguously loses its id, so ids never move to a different element;
+  // unkeyed rows in a rebuilt list get new ids this way.
 
   const NON_LAYER_TAGS = new Set([
     "SCRIPT",
@@ -333,11 +255,20 @@
     "HEAD",
   ]);
 
-  const tracked = new Map(); // id -> { el, desc, touched, rect }
+  const nodes = new Map(); // id -> { el, desc }
   const idOf = new WeakMap(); // element -> id
+  const descCache = new WeakMap(); // element -> recipe (or null)
+  const loaded = new Set(); // ids whose children the host has, plus "root"
   let nextId = 0;
-  let pickSeq = 0;
-  let selectionRaf = 0;
+
+  function nameOf(el) {
+    const dataName = el.getAttribute("data-name");
+    if (dataName) return dataName;
+    const tag = el.tagName.toLowerCase();
+    if (el.classList.length > 0) return `${tag}.${el.classList[0]}`;
+    if (el.id) return `${tag}#${el.id}`;
+    return tag;
+  }
 
   function isLayer(el) {
     return el.nodeType === 1 && !NON_LAYER_TAGS.has(el.tagName);
@@ -347,22 +278,13 @@
     return Array.from(el.children).filter(isLayer);
   }
 
+  function hasLayerChildren(el) {
+    for (const child of el.children) if (isLayer(child)) return true;
+    return false;
+  }
+
   function isRoot(el) {
     return el === document.body || el === document.documentElement;
-  }
-
-  function rectOf(el) {
-    const r = el.getBoundingClientRect();
-    return { x: r.x, y: r.y, width: r.width, height: r.height };
-  }
-
-  function sameRect(a, b) {
-    return (
-      Math.abs(a.x - b.x) < 0.01 &&
-      Math.abs(a.y - b.y) < 0.01 &&
-      Math.abs(a.width - b.width) < 0.01 &&
-      Math.abs(a.height - b.height) < 0.01
-    );
   }
 
   function keyAttrOf(el) {
@@ -397,20 +319,26 @@
   }
 
   /** How to find this element again after the page rebuilds it, or null if that's unsafe. */
-  function describe(el) {
-    const steps = [];
-    let node = el;
-    while (!isRoot(node)) {
-      const key = keyAttrOf(node);
-      if (key && findByAttr(key) === node) return { anchor: key, steps: steps.reverse() };
-      const parent = node.parentElement;
-      if (!parent) return null;
-      const signature = signatureOf(node);
-      if (uniqueChildWith(parent, signature) !== node) return null;
-      steps.push(signature);
-      node = parent;
+  function descOf(el) {
+    if (descCache.has(el)) return descCache.get(el);
+    let desc = null;
+    if (isRoot(el)) {
+      desc = { anchor: null, steps: [] };
+    } else {
+      const key = keyAttrOf(el);
+      const parent = el.parentElement;
+      if (key && findByAttr(key) === el) {
+        desc = { anchor: key, steps: [] };
+      } else if (parent) {
+        const parentDesc = descOf(parent);
+        const signature = signatureOf(el);
+        if (parentDesc && uniqueChildWith(parent, signature) === el) {
+          desc = { anchor: parentDesc.anchor, steps: [...parentDesc.steps, signature] };
+        }
+      }
     }
-    return { anchor: null, steps: steps.reverse() };
+    descCache.set(el, desc);
+    return desc;
   }
 
   function refind(desc) {
@@ -423,14 +351,319 @@
     return node && !isRoot(node) ? node : null;
   }
 
+  function idFor(el) {
+    const known = idOf.get(el);
+    if (known && nodes.get(known)?.el === el) return known;
+    const id = `n${++nextId}`;
+    nodes.set(id, { el, desc: descOf(el) });
+    idOf.set(el, id);
+    return id;
+  }
+
+  function elOf(id) {
+    if (id === "root") return document.body;
+    const node = nodes.get(id);
+    return node && node.el.isConnected ? node.el : null;
+  }
+
+  function nodeInfo(el) {
+    return { id: idFor(el), name: nameOf(el), hasChildren: hasLayerChildren(el) };
+  }
+
+  /** Ids from the top-level element (a child of <body>) down to el. */
+  function pathOf(el) {
+    const path = [];
+    for (let node = el; node && !isRoot(node); node = node.parentElement) path.push(idFor(node));
+    return path.reverse();
+  }
+
+  function rectOf(el) {
+    const r = el.getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height };
+  }
+
+  function sameRect(a, b) {
+    return (
+      Math.abs(a.x - b.x) < 0.01 &&
+      Math.abs(a.y - b.y) < 0.01 &&
+      Math.abs(a.width - b.width) < 0.01 &&
+      Math.abs(a.height - b.height) < 0.01
+    );
+  }
+
+  function onMutations(records) {
+    const removed = [];
+    const rebound = [];
+    for (const [id, node] of nodes) {
+      if (node.el.isConnected) continue;
+      const successor = refind(node.desc);
+      const owner = successor && idOf.get(successor);
+      const taken = owner && owner !== id && nodes.get(owner)?.el === successor;
+      if (successor && !taken) {
+        node.el = successor;
+        idOf.set(successor, id);
+        rebound.push(id);
+      } else {
+        nodes.delete(id);
+        loaded.delete(id);
+        removed.push(id);
+      }
+    }
+
+    const changed = new Set(rebound);
+    for (const record of records) {
+      if (record.type !== "childList") continue;
+      const target = record.target;
+      if (target === document.body) changed.add("root");
+      else if (nodes.get(idOf.get(target))?.el === target) changed.add(idOf.get(target));
+    }
+
+    if (connected && (removed.length > 0 || changed.size > 0)) {
+      const updates = [];
+      for (const id of changed) {
+        const el = elOf(id);
+        if (!el) continue;
+        updates.push({
+          id,
+          hasChildren: hasLayerChildren(el),
+          children: loaded.has(id) ? layerChildren(el).map(nodeInfo) : undefined,
+        });
+      }
+      send("treeUpdate", { removed, changed: updates });
+    }
+    checkSelection();
+  }
+
+  new MutationObserver(onMutations).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+
+  // ---- Layers tree -----------------------------------------------------------
+
+  function answerChildren(req, id) {
+    const el = elOf(id);
+    if (el) loaded.add(id);
+    send("childrenResult", { req, id, nodes: el ? layerChildren(el).map(nodeInfo) : null });
+  }
+
+  /** Everything the host needs to show el: its path, and the children of every level above it. */
+  function answerReveal(req, id) {
+    const el = elOf(id);
+    if (!el || el === document.body) {
+      send("revealResult", { req, id, path: null, lists: null });
+      return;
+    }
+    const path = pathOf(el);
+    const lists = {};
+    let parent = document.body;
+    for (const key of ["root", ...path.slice(0, -1)]) {
+      if (key !== "root") parent = elOf(key);
+      if (!parent) break;
+      lists[key] = layerChildren(parent).map(nodeInfo);
+      loaded.add(key);
+    }
+    send("revealResult", { req, id, path, lists });
+  }
+
+  const SEARCH_LIMIT = 5000;
+
+  /** Walks the whole page, including parts the host never loaded. Matching is case-insensitive. */
+  function answerSearch(req, query) {
+    const q = query.trim().toLowerCase();
+    const all = [];
+    const included = new Set();
+    const matches = [];
+    if (q) {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
+        acceptNode: (n) => (isLayer(n) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT),
+      });
+      for (let el = walker.nextNode(); el; el = walker.nextNode()) {
+        all.push(el);
+        if (!nameOf(el).toLowerCase().includes(q)) continue;
+        matches.push(el);
+        for (let n = el; n && !isRoot(n) && !included.has(n); n = n.parentElement) included.add(n);
+      }
+    }
+    // Ancestors come before descendants in document order, so a cut never orphans a row.
+    const kept = all.filter((el) => included.has(el));
+    const truncated = kept.length > SEARCH_LIMIT;
+    const out = kept.slice(0, SEARCH_LIMIT).map((el) => ({
+      ...nodeInfo(el),
+      parent: el.parentElement === document.body ? "root" : idFor(el.parentElement),
+    }));
+    const keptIds = new Set(out.map((n) => n.id));
+    send("searchResult", {
+      req,
+      nodes: out,
+      matches: matches.map(idFor).filter((id) => keptIds.has(id)),
+      truncated,
+    });
+  }
+
+  /** Scrolls only this page (nested scroll areas, then the window) until el is in view. */
+  function scrollIntoPage(el) {
+    for (let box = el.parentElement; box && !isRoot(box); box = box.parentElement) {
+      const style = getComputedStyle(box);
+      const scrollsY = /(auto|scroll|overlay)/.test(style.overflowY) && box.scrollHeight > box.clientHeight;
+      const scrollsX = /(auto|scroll|overlay)/.test(style.overflowX) && box.scrollWidth > box.clientWidth;
+      if (!scrollsY && !scrollsX) continue;
+      const r = el.getBoundingClientRect();
+      const c = box.getBoundingClientRect();
+      const top = c.top + box.clientTop;
+      const left = c.left + box.clientLeft;
+      if (scrollsY) box.scrollTop += overflowBy(r.top, r.bottom, top, top + box.clientHeight);
+      if (scrollsX) box.scrollLeft += overflowBy(r.left, r.right, left, left + box.clientWidth);
+    }
+    const r = el.getBoundingClientRect();
+    const view = document.documentElement;
+    window.scrollBy(
+      overflowBy(r.left, r.right, 0, view.clientWidth),
+      overflowBy(r.top, r.bottom, 0, view.clientHeight),
+    );
+  }
+
+  /** How far to scroll so [start, end] is inside [min, max]; prefers showing the start. */
+  function overflowBy(start, end, min, max) {
+    if (start < min) return start - min;
+    if (end > max) return Math.min(end - max, start - min);
+    return 0;
+  }
+
+  function pickById(id, shiftKey) {
+    if (mode !== "select") return;
+    const el = elOf(id);
+    if (!el || el === document.body) return;
+    scrollIntoPage(el);
+    pickSeq++;
+    send("pick", { seq: pickSeq, shiftKey, target: track(el) });
+  }
+
+  // ---- Hover (Select mode) -------------------------------------------------
+  // The element under the pointer (or the element of a hovered layers row) is re-measured every
+  // frame, so the outline follows page scroll, nested scroll areas, resizes and re-renders. Only
+  // changes are sent.
+
+  let pointer = null; // { x, y } in this page's viewport px, or null when outside
+  let pinnedId = null; // element of the hovered layers row; the real pointer wins over it
+  let hover = null; // last target sent: { id, x, y, width, height }
+  let hoverEpoch = 0;
+  let suppressed = false;
+  let rafId = 0;
+
+  function elementAt(x, y) {
+    const el = document.elementFromPoint(x, y);
+    if (!el || el === document.documentElement || el === document.body) return null;
+    return el;
+  }
+
+  function setHover(next) {
+    if (next === null) {
+      if (hover === null) return;
+      hover = null;
+      send("hover", { epoch: hoverEpoch, target: null });
+      return;
+    }
+    hover = next;
+    send("hover", {
+      epoch: hoverEpoch,
+      target: {
+        id: next.id,
+        path: next.path,
+        name: next.name,
+        rect: { x: next.x, y: next.y, width: next.width, height: next.height },
+      },
+    });
+  }
+
+  function measureHover() {
+    const el = pointer ? elementAt(pointer.x, pointer.y) : pinnedId ? elOf(pinnedId) : null;
+    if (!el || el === document.body) return setHover(null);
+    const r = el.getBoundingClientRect();
+    const id = idFor(el);
+    if (hover && hover.id === id && sameRect(hover, r)) return;
+    setHover({ id, path: pathOf(el), name: nameOf(el), x: r.x, y: r.y, width: r.width, height: r.height });
+  }
+
+  function hoverTick() {
+    rafId = 0;
+    if (mode !== "select" || (!pointer && !pinnedId) || suppressed) return;
+    measureHover();
+    rafId = requestAnimationFrame(hoverTick);
+  }
+
+  function startHoverLoop() {
+    if (!rafId && connected) rafId = requestAnimationFrame(hoverTick);
+  }
+
+  function stopHoverLoop() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = 0;
+  }
+
+  /** The host already cleared its copy, so forget ours without sending anything. */
+  function suppressHover() {
+    suppressed = true;
+    pinnedId = null;
+    hover = null;
+    stopHoverLoop();
+  }
+
+  function pointerLeft() {
+    pointer = null;
+    stopHoverLoop();
+    setHover(null);
+  }
+
+  function hoverNode(id) {
+    pinnedId = id;
+    if (pointer) return;
+    if (!id) {
+      stopHoverLoop();
+      setHover(null);
+      return;
+    }
+    if (mode !== "select" || !connected) return;
+    suppressed = false;
+    measureHover();
+    startHoverLoop();
+  }
+
+  window.addEventListener(
+    "pointermove",
+    (event) => {
+      pointer = { x: event.clientX, y: event.clientY };
+      pinnedId = null;
+      suppressed = false;
+      if (mode !== "select" || !connected) return;
+      measureHover();
+      startHoverLoop();
+    },
+    true,
+  );
+  document.documentElement.addEventListener("mouseleave", pointerLeft);
+  window.addEventListener(
+    "pointerout",
+    (event) => {
+      if (!event.relatedTarget) pointerLeft();
+    },
+    true,
+  );
+
+  // ---- Selection -----------------------------------------------------------
+  // The host owns the selection; the agent measures the selected elements, reports their boxes
+  // whenever they change and reports when they stop existing (their id was dropped above).
+
+  const selected = new Map(); // id -> { touched, rect }
+  let pickSeq = 0;
+  let selectionRaf = 0;
+
   function track(el) {
-    let id = idOf.get(el);
-    let entry = id && tracked.get(id);
-    if (!entry || entry.el !== el) {
-      id = `e${++nextId}`;
-      entry = { el, desc: describe(el), touched: 0, rect: null };
-      tracked.set(id, entry);
-      idOf.set(el, id);
+    const id = idFor(el);
+    let entry = selected.get(id);
+    if (!entry) {
+      entry = { touched: 0, rect: null };
+      selected.set(id, entry);
     }
     // Survives a host "selection" message that was sent before the host saw this pick.
     entry.touched = pickSeq;
@@ -439,41 +672,29 @@
     return { id, name: nameOf(el), rect: entry.rect };
   }
 
-  function untrack(id) {
-    const entry = tracked.get(id);
-    if (!entry) return;
-    tracked.delete(id);
-    if (idOf.get(entry.el) === id) idOf.delete(entry.el);
-  }
-
   function syncSelection(ids, seq) {
     const keep = new Set(ids);
-    for (const [id, entry] of tracked) {
-      if (!keep.has(id) && entry.touched <= seq) untrack(id);
+    for (const [id, entry] of selected) {
+      if (!keep.has(id) && entry.touched <= seq) selected.delete(id);
     }
-    const missing = ids.filter((id) => !tracked.has(id));
+    const missing = ids.filter((id) => !selected.has(id));
     if (missing.length > 0) send("selectionRemoved", { ids: missing });
-    if (tracked.size === 0) stopSelectionLoop();
+    if (selected.size === 0) stopSelectionLoop();
   }
 
   function checkSelection() {
-    if (tracked.size === 0) return;
+    if (selected.size === 0) return;
     const removed = [];
     const rects = {};
     let moved = false;
-    for (const [id, entry] of tracked) {
-      if (!entry.el.isConnected) {
-        const successor = refind(entry.desc);
-        const owner = successor && idOf.get(successor);
-        if (!successor || (owner && owner !== id && tracked.has(owner))) {
-          untrack(id);
-          removed.push(id);
-          continue;
-        }
-        entry.el = successor;
-        idOf.set(successor, id);
+    for (const [id, entry] of selected) {
+      const el = elOf(id);
+      if (!el) {
+        selected.delete(id);
+        removed.push(id);
+        continue;
       }
-      const rect = rectOf(entry.el);
+      const rect = rectOf(el);
       if (!entry.rect || !sameRect(entry.rect, rect)) {
         entry.rect = rect;
         rects[id] = rect;
@@ -488,13 +709,13 @@
   // is off-screen, so DOM mutations are also checked directly to report removals promptly.
   function selectionTick() {
     selectionRaf = 0;
-    if (tracked.size === 0) return;
+    if (selected.size === 0) return;
     checkSelection();
     selectionRaf = requestAnimationFrame(selectionTick);
   }
 
   function startSelectionLoop() {
-    if (!selectionRaf && tracked.size > 0) selectionRaf = requestAnimationFrame(selectionTick);
+    if (!selectionRaf && selected.size > 0) selectionRaf = requestAnimationFrame(selectionTick);
   }
 
   function stopSelectionLoop() {
@@ -502,18 +723,12 @@
     selectionRaf = 0;
   }
 
-  new MutationObserver(checkSelection).observe(document.documentElement, {
-    childList: true,
-    subtree: true,
-  });
   window.addEventListener("scroll", checkSelection, { capture: true, passive: true });
 
   function navigateFrom(id, direction) {
-    checkSelection();
-    const entry = tracked.get(id);
+    const el = elOf(id);
     let target = null;
-    if (entry) {
-      const el = entry.el;
+    if (el && el !== document.body) {
       const parent = el.parentElement;
       if (direction === "firstChild") {
         target = layerChildren(el)[0] || null;

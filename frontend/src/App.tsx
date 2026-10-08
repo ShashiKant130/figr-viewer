@@ -1,5 +1,6 @@
 import { Board } from "./board/Board";
 import { Inspector } from "./inspector/Inspector";
+import { LayersPanel } from "./layers/LayersPanel";
 import { Toolbar } from "./Toolbar";
 
 export function App() {
@@ -7,10 +8,7 @@ export function App() {
     <div className="app">
       <Toolbar />
       <div className="workspace">
-        <aside className="panel panel--layers">
-          <div className="panel-header">Layers</div>
-          <div className="panel-empty">Click something in a preview</div>
-        </aside>
+        <LayersPanel />
         <Board />
         <Inspector />
       </div>
