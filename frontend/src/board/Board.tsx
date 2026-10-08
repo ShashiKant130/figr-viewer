@@ -7,6 +7,8 @@ import {
   type CSSProperties,
 } from "react";
 import { clearSelection } from "../bridge/hostBridge";
+import { RenderFault } from "../failures/devFaults";
+import { useGuard, useRegionFail } from "../failures/Region";
 import { useStore } from "../lib/store";
 import { wheelDeltaToPixels } from "../lib/dom";
 import { modeStore } from "../modes";
@@ -33,6 +35,8 @@ export function Board() {
   const screens = useScreens();
   const [panning, setPanning] = useState(false);
   const fittedRef = useRef(false);
+  const guard = useGuard();
+  const fail = useRegionFail();
 
   useLayoutEffect(() => {
     setViewportElement(viewportRef.current);
@@ -61,23 +65,27 @@ export function Board() {
     const el = viewportRef.current!;
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
-      const page = el.clientHeight;
-      if (event.ctrlKey || event.metaKey) {
-        zoomAtClient(
-          event.clientX,
-          event.clientY,
-          wheelDeltaToPixels(event.deltaY, event.deltaMode, page),
-        );
-        return;
+      try {
+        const page = el.clientHeight;
+        if (event.ctrlKey || event.metaKey) {
+          zoomAtClient(
+            event.clientX,
+            event.clientY,
+            wheelDeltaToPixels(event.deltaY, event.deltaMode, page),
+          );
+          return;
+        }
+        let dx = wheelDeltaToPixels(event.deltaX, event.deltaMode, el.clientWidth);
+        let dy = wheelDeltaToPixels(event.deltaY, event.deltaMode, page);
+        if (event.shiftKey && dx === 0) [dx, dy] = [dy, 0];
+        panBy(-dx, -dy);
+      } catch (error) {
+        fail(error);
       }
-      let dx = wheelDeltaToPixels(event.deltaX, event.deltaMode, el.clientWidth);
-      let dy = wheelDeltaToPixels(event.deltaY, event.deltaMode, page);
-      if (event.shiftKey && dx === 0) [dx, dy] = [dy, 0];
-      panBy(-dx, -dy);
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
-  }, []);
+  }, [fail]);
 
   const drag = useRef<{
     pointerId: number;
@@ -139,12 +147,13 @@ export function Board() {
       ref={viewportRef}
       className={`board${panning ? " is-panning" : ""}`}
       style={viewportStyle}
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={endDrag}
-      onPointerCancel={endDrag}
-      onLostPointerCapture={endDrag}
+      onPointerDown={guard(onPointerDown)}
+      onPointerMove={guard(onPointerMove)}
+      onPointerUp={guard(endDrag)}
+      onPointerCancel={guard(endDrag)}
+      onLostPointerCapture={guard(endDrag)}
     >
+      <RenderFault region="board" />
       <div className="world" style={worldStyle}>
         {screenList?.map((screen, i) => (
           <Preview key={screen.id} screen={screen} slot={slots[i]} />

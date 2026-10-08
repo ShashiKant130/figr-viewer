@@ -1,4 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { RenderFault, takeFault } from "../failures/devFaults";
+import { Region, RegionError, useGuard } from "../failures/Region";
 import { useStore } from "../lib/store";
 import { hoverStore } from "../overlay/hoverStore";
 import { selectionStore } from "../overlay/selectionStore";
@@ -7,6 +9,7 @@ import {
   hoverRow,
   pickRow,
   retry,
+  retrySearch,
   savedScrollTop,
   saveScrollTop,
   setExpanded,
@@ -25,17 +28,29 @@ export function LayersPanel() {
   return (
     <aside className="panel panel--layers">
       <div className="panel-header">Layers</div>
-      {screenId ? (
-        <LayersTree key={screenId} screenId={screenId} />
-      ) : (
-        <div className="panel-empty">Click something in a preview</div>
-      )}
+      <Region
+        id="layers"
+        context={() => ({ region: "layers", screenId: selectionStore.get().screenId })}
+        fallback={(failure, retryPanel) => (
+          <RegionError failure={failure} retry={retryPanel} fallbackTitle="The layers panel stopped working" />
+        )}
+      >
+        <RenderFault region="layers" />
+        {screenId ? (
+          <LayersTree key={screenId} screenId={screenId} />
+        ) : (
+          <div className="panel-empty">Click something in a preview</div>
+        )}
+      </Region>
     </aside>
   );
 }
 
+const depthOf = (row: Row) => (row.kind === "message" || row.kind === "searchError" ? 0 : row.depth);
+
 function LayersTree({ screenId }: { screenId: string }) {
   const tree = useStore(layersStore, (s) => s[screenId]) ?? EMPTY_TREE;
+  const guard = useGuard();
   const selection = useStore(selectionStore);
   const hover = useStore(hoverStore);
   const rows = useMemo(() => visibleRows(tree), [tree]);
@@ -61,7 +76,7 @@ function LayersTree({ screenId }: { screenId: string }) {
   }, [rows]);
   const maxDepth = useMemo(() => {
     let max = 0;
-    for (const row of rows) if (row.kind !== "message" && row.depth > max) max = row.depth;
+    for (const row of rows) max = Math.max(max, depthOf(row));
     return max;
   }, [rows]);
 
@@ -80,8 +95,7 @@ function LayersTree({ screenId }: { screenId: string }) {
       el.scrollTop = top + ROW_HEIGHT - el.clientHeight;
     }
     // Deep rows are indented past the panel edge; bring the name into view too.
-    const row = rows[index];
-    const left = 8 + (row.kind === "message" ? 0 : row.depth) * INDENT;
+    const left = 8 + depthOf(rows[index]) * INDENT;
     if (left < el.scrollLeft || left + NAME_MIN_WIDTH > el.scrollLeft + el.clientWidth) {
       el.scrollLeft = Math.max(0, left - 2 * INDENT);
     }
@@ -166,14 +180,14 @@ function LayersTree({ screenId }: { screenId: string }) {
           placeholder="Search layers"
           aria-label="Search layers"
           value={tree.search?.query ?? ""}
-          onChange={(e) => setSearch(screenId, e.target.value)}
-          onKeyDown={(e) => {
+          onChange={guard((e: React.ChangeEvent<HTMLInputElement>) => setSearch(screenId, e.target.value))}
+          onKeyDown={guard((e: React.KeyboardEvent) => {
             if (e.key === "Escape" && tree.search) {
               e.preventDefault();
               e.stopPropagation();
               setSearch(screenId, "");
             }
-          }}
+          })}
         />
         {tree.search?.results?.truncated && (
           <div className="layers-search-note">Showing the first results only</div>
@@ -186,13 +200,13 @@ function LayersTree({ screenId }: { screenId: string }) {
         aria-label="Layers"
         aria-multiselectable
         tabIndex={0}
-        onKeyDown={onKeyDown}
-        onScroll={(e) => {
+        onKeyDown={guard(onKeyDown)}
+        onScroll={guard((e: React.UIEvent<HTMLDivElement>) => {
           const top = e.currentTarget.scrollTop;
           setScrollTop(top);
           saveScrollTop(screenId, top);
-        }}
-        onMouseLeave={() => hoverRow(screenId, null)}
+        })}
+        onMouseLeave={guard(() => hoverRow(screenId, null))}
       >
         <div
           className="layers-spacer"
@@ -200,7 +214,7 @@ function LayersTree({ screenId }: { screenId: string }) {
         >
           {rows.slice(first, last).map((row, i) => (
             <RowView
-              key={row.kind === "node" ? row.id : row.kind === "message" ? "message" : `${row.kind}:${row.key}`}
+              key={row.kind === "node" ? row.id : "key" in row ? `${row.kind}:${row.key}` : row.kind}
               row={row}
               top={(first + i) * ROW_HEIGHT}
               screenId={screenId}
@@ -234,12 +248,23 @@ type RowProps = {
 
 const RowView = memo(function RowView(props: RowProps) {
   const { row, top, screenId } = props;
+  const guard = useGuard();
   const style = { top, height: ROW_HEIGHT };
 
   if (row.kind === "message") {
     return (
       <div className="layers-row layers-row--muted" style={{ ...style, paddingLeft: 12 }}>
         {row.text}
+      </div>
+    );
+  }
+  if (row.kind === "searchError") {
+    return (
+      <div className="layers-row layers-row--error" style={{ ...style, paddingLeft: 12 }}>
+        Search failed
+        <button type="button" className="layers-retry" onClick={guard(() => retrySearch(screenId))}>
+          Retry
+        </button>
       </div>
     );
   }
@@ -250,7 +275,7 @@ const RowView = memo(function RowView(props: RowProps) {
       <div
         className="layers-row layers-row--muted"
         style={{ ...style, paddingLeft }}
-        onMouseEnter={() => hoverRow(screenId, null)}
+        onMouseEnter={guard(() => hoverRow(screenId, null))}
       >
         Loading…
       </div>
@@ -261,10 +286,10 @@ const RowView = memo(function RowView(props: RowProps) {
       <div
         className="layers-row layers-row--error"
         style={{ ...style, paddingLeft }}
-        onMouseEnter={() => hoverRow(screenId, null)}
+        onMouseEnter={guard(() => hoverRow(screenId, null))}
       >
         Couldn't load
-        <button type="button" className="layers-retry" onClick={() => retry(screenId, row.key)}>
+        <button type="button" className="layers-retry" onClick={guard(() => retry(screenId, row.key))}>
           Retry
         </button>
       </div>
@@ -285,8 +310,11 @@ const RowView = memo(function RowView(props: RowProps) {
       aria-selected={props.selected}
       className={classes.join(" ")}
       style={{ ...style, paddingLeft: 8 + row.depth * INDENT }}
-      onMouseEnter={() => hoverRow(screenId, id)}
-      onClick={(e) => pickRow(screenId, id, e.shiftKey)}
+      onMouseEnter={guard(() => hoverRow(screenId, id))}
+      onClick={guard((e: React.MouseEvent) => {
+        if (takeFault("layersClick")) throw new Error("Dev: error in a layers row click handler");
+        pickRow(screenId, id, e.shiftKey);
+      })}
     >
       {props.hasChildren ? (
         <button
@@ -295,10 +323,10 @@ const RowView = memo(function RowView(props: RowProps) {
           className={`layers-chevron${props.expanded ? " is-open" : ""}`}
           aria-label={props.expanded ? "Collapse" : "Expand"}
           disabled={props.searching}
-          onClick={(e) => {
+          onClick={guard((e: React.MouseEvent) => {
             e.stopPropagation();
             toggleExpanded(screenId, id);
-          }}
+          })}
         >
           <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden>
             <path d="M3 1.5 7 5 3 8.5" fill="none" stroke="currentColor" strokeWidth="1.4" />

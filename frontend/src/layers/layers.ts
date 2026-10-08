@@ -1,4 +1,6 @@
 import { sendToPreview, setTreeHandlers, type TreeMessage } from "../bridge/hostBridge";
+import { takeFault } from "../failures/devFaults";
+import { guard, reportOnce } from "../failures/regions";
 import { modeStore } from "../modes";
 import { selectionStore } from "../overlay/selectionStore";
 import {
@@ -20,6 +22,16 @@ let revealSeq = 0;
 const scrollTops = new Map<string, number>();
 const pendingReveal = new Map<string, number>();
 const searchTimers = new Map<string, number>();
+
+/** A timer callback that fails the layers panel if it throws. */
+function later(screenId: string, ms: number, fn: () => void): number {
+  return window.setTimeout(guard("layers", () => ({ region: "layers", screenId }), fn), ms);
+}
+
+/** The root list is the panel's own content; any deeper list is that row's region. */
+function reportListFailure(screenId: string, key: string, error: Error) {
+  reportOnce(error, { region: key === ROOT ? "layers" : "layers-row", screenId });
+}
 
 function update(screenId: string, fn: (tree: PreviewTree) => PreviewTree) {
   layersStore.set((prev) => {
@@ -69,14 +81,14 @@ function requestChildren(screenId: string, key: string) {
     ...tree,
     lists: { ...tree.lists, [key]: { status: "loading", ids: [], req } },
   }));
-  sendToPreview(screenId, { type: "children", req, id: key });
-  window.setTimeout(() => {
-    update(screenId, (tree) => {
-      const list = tree.lists[key];
-      if (!list || list.req !== req || list.status !== "loading") return tree;
-      return { ...tree, lists: { ...tree.lists, [key]: { ...list, status: "error" } } };
-    });
-  }, LOAD_TIMEOUT_MS);
+  if (!takeFault("children")) sendToPreview(screenId, { type: "children", req, id: key });
+  later(screenId, LOAD_TIMEOUT_MS, () => {
+    // Answered, retried, or the page reloaded meanwhile: this request no longer matters.
+    const list = layersStore.get()[screenId]?.lists[key];
+    if (!list || list.req !== req || list.status !== "loading") return;
+    update(screenId, (tree) => ({ ...tree, lists: { ...tree.lists, [key]: { ...list, status: "error" } } }));
+    reportListFailure(screenId, key, new Error(`The page didn't send the children of ${key} within 3 seconds`));
+  });
 }
 
 export function ensureLoaded(screenId: string) {
@@ -158,22 +170,29 @@ export function setSearch(screenId: string, query: string) {
 
 function scheduleSearch(screenId: string) {
   window.clearTimeout(searchTimers.get(screenId));
-  searchTimers.set(screenId, window.setTimeout(() => runSearch(screenId), SEARCH_DEBOUNCE_MS));
+  searchTimers.set(screenId, later(screenId, SEARCH_DEBOUNCE_MS, () => runSearch(screenId)));
+}
+
+export function retrySearch(screenId: string) {
+  runSearch(screenId);
 }
 
 function runSearch(screenId: string) {
   const search = layersStore.get()[screenId]?.search;
   if (!search) return;
   const req = ++nextReq;
-  update(screenId, (t) => (t.search ? { ...t, search: { ...t.search, req } } : t));
+  update(screenId, (t) => (t.search ? { ...t, search: { ...t.search, status: "loading", req } } : t));
   sendToPreview(screenId, { type: "search", req, query: search.query });
-  window.setTimeout(() => {
-    update(screenId, (t) =>
-      t.search?.req === req && t.search.status === "loading"
-        ? { ...t, search: { ...t.search, status: "error" } }
-        : t,
-    );
-  }, LOAD_TIMEOUT_MS);
+  later(screenId, LOAD_TIMEOUT_MS, () => {
+    // A newer query or a cleared search replaced this one; that's not a failure.
+    const current = layersStore.get()[screenId]?.search;
+    if (current?.req !== req || current.status !== "loading") return;
+    update(screenId, (t) => (t.search ? { ...t, search: { ...t.search, status: "error" } } : t));
+    reportOnce(new Error(`The page didn't answer the search "${current.query}" within 3 seconds`), {
+      region: "layers",
+      screenId,
+    });
+  });
 }
 
 // ---- Messages from the page --------------------------------------------------------
@@ -181,13 +200,16 @@ function runSearch(screenId: string) {
 function onChildren(screenId: string, msg: TreeMessage) {
   const { id: key, req } = msg;
   if (typeof key !== "string") return;
-  update(screenId, (tree) => {
-    const list = tree.lists[key];
-    if (!list || list.req !== req) return tree;
-    const children = parseNodes(msg.nodes);
-    if (!children) return { ...tree, lists: { ...tree.lists, [key]: { ...list, status: "error" } } };
-    return withList(tree, key, children, list.req);
-  });
+  const list = layersStore.get()[screenId]?.lists[key];
+  if (!list || list.req !== req) return;
+  const children = parseNodes(msg.nodes);
+  if (!children) {
+    if (list.status === "error") return;
+    update(screenId, (tree) => ({ ...tree, lists: { ...tree.lists, [key]: { ...list, status: "error" } } }));
+    reportListFailure(screenId, key, new Error(`The page sent unreadable children for ${key}`));
+    return;
+  }
+  update(screenId, (tree) => withList(tree, key, children, list.req));
 }
 
 function onReveal(screenId: string, msg: TreeMessage) {

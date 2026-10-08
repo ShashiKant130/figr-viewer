@@ -54,7 +54,8 @@ export type Row =
   | { kind: "node"; id: string; depth: number; parent: string }
   | { kind: "loading"; key: string; depth: number }
   | { kind: "error"; key: string; depth: number }
-  | { kind: "message"; text: string };
+  | { kind: "message"; text: string }
+  | { kind: "searchError" };
 
 /** The rows on screen, top to bottom: the normal tree, or the search results while searching. */
 export function visibleRows(tree: PreviewTree): Row[] {
@@ -63,8 +64,12 @@ export function visibleRows(tree: PreviewTree): Row[] {
 
   if (search) {
     const results = search.results;
+    if (search.status === "error") {
+      rows.push({ kind: "searchError" });
+      return rows;
+    }
     if (!results) {
-      rows.push({ kind: "message", text: search.status === "error" ? "Search failed" : "Searching…" });
+      rows.push({ kind: "message", text: "Searching…" });
       return rows;
     }
     const walk = (key: string, depth: number) => {

@@ -1,3 +1,5 @@
+import { RenderFault } from "../failures/devFaults";
+import { Region, RegionError, useGuard } from "../failures/Region";
 import { useStore } from "../lib/store";
 import { selectionStore } from "../overlay/selectionStore";
 import { liveStore, type LiveProps } from "./liveStore";
@@ -27,6 +29,24 @@ const FIELDS: Field[] = [
 const MIXED = "Mixed";
 
 export function Inspector() {
+  return (
+    <aside className="panel panel--inspector">
+      <div className="panel-header">Inspector</div>
+      <Region
+        id="inspector"
+        context={() => ({ region: "inspector", screenId: selectionStore.get().screenId })}
+        fallback={(failure, retry) => (
+          <RegionError failure={failure} retry={retry} fallbackTitle="The inspector stopped working" />
+        )}
+      >
+        <RenderFault region="inspector" />
+        <InspectorBody />
+      </Region>
+    </aside>
+  );
+}
+
+function InspectorBody() {
   const selection = useStore(selectionStore);
   const live = useStore(liveStore);
   const pageLive = selection.screenId ? live[selection.screenId] : undefined;
@@ -43,12 +63,7 @@ export function Inspector() {
     body = <div className="panel-empty">Nothing selected</div>;
   }
 
-  return (
-    <aside className="panel panel--inspector">
-      <div className="panel-header">Inspector</div>
-      <div className="inspector-body">{body}</div>
-    </aside>
-  );
+  return <div className="inspector-body">{body}</div>;
 }
 
 function SingleElement({ props, screenId }: { props: LiveProps | undefined; screenId: string | null }) {
@@ -68,7 +83,19 @@ function SingleElement({ props, screenId }: { props: LiveProps | undefined; scre
       </section>
       <section className="inspector-section">
         <h3 className="inspector-heading">Details</h3>
-        {props ? <Details elementKey={props.key} screenId={screenId} /> : <div className="inspector-note">Reading…</div>}
+        {props ? (
+          <Region
+            id="details"
+            context={() => ({ region: "details", screenId, elementKey: props.key ?? undefined })}
+            fallback={(failure, retry) => (
+              <RegionError failure={failure} retry={retry} fallbackTitle="Couldn't load details" />
+            )}
+          >
+            <Details elementKey={props.key} screenId={screenId} />
+          </Region>
+        ) : (
+          <div className="inspector-note">Reading…</div>
+        )}
       </section>
     </>
   );
@@ -109,6 +136,7 @@ function FieldRow({ field, value }: { field: Field; value: string }) {
 
 function Details({ elementKey, screenId }: { elementKey: string | null; screenId: string | null }) {
   const { state, retry } = useElementDetails(elementKey, screenId);
+  const guard = useGuard();
 
   if (state === null) return <div className="inspector-note">No details</div>;
   switch (state.status) {
@@ -120,7 +148,7 @@ function Details({ elementKey, screenId }: { elementKey: string | null; screenId
       return (
         <div className="inspector-error">
           <span>Couldn't load details</span>
-          <button type="button" onClick={retry}>
+          <button type="button" onClick={guard(retry)}>
             Retry
           </button>
         </div>

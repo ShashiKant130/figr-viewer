@@ -1,4 +1,5 @@
 import { clearSelection, navigateSelection } from "./bridge/hostBridge";
+import { guard } from "./failures/regions";
 import { isEditableTarget } from "./lib/dom";
 import { modeStore, setMode } from "./modes";
 
@@ -43,10 +44,13 @@ let installed = false;
 export function installHostShortcuts() {
   if (installed) return;
   installed = true;
-  window.addEventListener("keydown", (event) => {
-    if (event.defaultPrevented || event.isComposing || isEditableTarget(event.target)) return;
-    // Enter on a focused toolbar button should press it.
-    if (event.key === "Enter" && (event.target as Element | null)?.closest?.("button, a")) return;
-    if (handleShortcut(event)) event.preventDefault();
-  });
+  window.addEventListener(
+    "keydown",
+    guard("board", () => ({ region: "board", screenId: null }), (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing || isEditableTarget(event.target)) return;
+      // Enter on a focused toolbar button should press it.
+      if (event.key === "Enter" && (event.target as Element | null)?.closest?.("button, a")) return;
+      if (handleShortcut(event)) event.preventDefault();
+    }),
+  );
 }

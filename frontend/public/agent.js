@@ -3,6 +3,9 @@
 //
 // agent -> host  { source: "figr-agent", session, type, ...payload }
 //   hello   { url }                         sent until the host answers with "init"
+//   leaving {}                              the page is unloading (navigation or reload)
+//   pageError { message }                   an uncaught error or unhandled rejection in the page;
+//                                           held until connected
 //   zoom    { x, y, deltaY, deltaMode }     Ctrl/Cmd + wheel over the page
 //   key     { key, shiftKey }               a host shortcut pressed while the page had focus
 //   hover   { epoch, target }               target: { id, path, name, rect } or null; path is
@@ -73,6 +76,7 @@
         clearInterval(helloTimer);
         hoverEpoch = typeof msg.hoverEpoch === "number" ? msg.hoverEpoch : 0;
         setMode(msg.mode);
+        for (const message of heldPageErrors.splice(0)) send("pageError", { message });
         break;
       case "mode":
         setMode(msg.mode);
@@ -107,6 +111,25 @@
         if (typeof msg.id === "string") pickById(msg.id, msg.shiftKey === true);
         break;
     }
+  });
+
+  window.addEventListener("pagehide", () => send("leaving", {}));
+
+  // ---- Page errors ---------------------------------------------------------
+
+  const heldPageErrors = [];
+
+  function pageError(message) {
+    if (connected) send("pageError", { message });
+    else if (heldPageErrors.length < 20) heldPageErrors.push(message);
+  }
+
+  window.addEventListener("error", (event) => {
+    pageError(event.message || (event.error && event.error.message) || "Script error");
+  });
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason;
+    pageError(reason instanceof Error ? reason.message : `Unhandled rejection: ${String(reason)}`);
   });
 
   // ---- Modes -------------------------------------------------------------

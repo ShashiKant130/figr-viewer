@@ -1,15 +1,20 @@
 import { API_ORIGIN, PAGES_ORIGIN } from "./config";
+import { takeFault, type Fault } from "./failures/devFaults";
 
 export type Screen = { id: string; name: string; url: string };
 
-/** `?latency=` and `?fail=` on the app URL are passed through to every API call, for testing. */
-function apiUrl(path: string): string {
+/**
+ * `?latency=` and `?fail=` on the app URL are passed through to every API call, for testing.
+ * An armed dev fault makes this one request fail on the server.
+ */
+function apiUrl(path: string, fault: Fault): string {
   const url = new URL(path, API_ORIGIN);
   const params = new URLSearchParams(window.location.search);
   for (const key of ["latency", "fail"]) {
     const value = params.get(key);
     if (value !== null) url.searchParams.set(key, value);
   }
+  if (takeFault(fault)) url.searchParams.set("fail", "1");
   return url.toString();
 }
 
@@ -23,8 +28,8 @@ export class ApiError extends Error {
   }
 }
 
-async function getJson(path: string, signal: AbortSignal): Promise<unknown> {
-  const res = await fetch(apiUrl(path), { signal });
+async function getJson(path: string, signal: AbortSignal, fault: Fault): Promise<unknown> {
+  const res = await fetch(apiUrl(path, fault), { signal });
   const text = await res.text();
   if (!res.ok) throw new ApiError(`GET ${path} failed with ${res.status}`, res.status);
   try {
@@ -61,7 +66,7 @@ export async function fetchElementDetails(key: string, signal: AbortSignal): Pro
   const path = `/elements/${encodeURIComponent(key)}`;
   let data: unknown;
   try {
-    data = await getJson(path, signal);
+    data = await getJson(path, signal, "details");
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) return null;
     throw error;
@@ -71,7 +76,7 @@ export async function fetchElementDetails(key: string, signal: AbortSignal): Pro
 }
 
 export async function fetchScreens(signal: AbortSignal): Promise<Screen[]> {
-  const data = await getJson("/screens", signal);
+  const data = await getJson("/screens", signal, "screens");
   if (!Array.isArray(data) || !data.every(isScreen)) {
     throw new ApiError("GET /screens returned unexpected data", 200);
   }

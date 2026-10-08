@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchScreens, type Screen } from "../api";
-import { report } from "../../report.js";
+import { devReloadStore } from "../failures/devFaults";
+import { reportOnce } from "../failures/regions";
+import { useStore } from "../lib/store";
 
 export type ScreensState =
   | { status: "loading" }
@@ -10,6 +12,7 @@ export type ScreensState =
 export function useScreens(): ScreensState & { retry: () => void } {
   const [state, setState] = useState<ScreensState>({ status: "loading" });
   const [attempt, setAttempt] = useState(0);
+  const devReload = useStore(devReloadStore, (s) => s.screens);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -21,7 +24,7 @@ export function useScreens(): ScreensState & { retry: () => void } {
       (error: unknown) => {
         // Aborted means the board moved on (unmount or retry); that is not a failure.
         if (controller.signal.aborted) return;
-        report(error, { region: "board", screenId: null });
+        reportOnce(error, { region: "board", screenId: null });
         setState({
           status: "error",
           message: error instanceof Error ? error.message : String(error),
@@ -29,7 +32,7 @@ export function useScreens(): ScreensState & { retry: () => void } {
       },
     );
     return () => controller.abort();
-  }, [attempt]);
+  }, [attempt, devReload]);
 
   const retry = useCallback(() => setAttempt((n) => n + 1), []);
   return { ...state, retry };

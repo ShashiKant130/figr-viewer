@@ -11,6 +11,12 @@ import {
   type Selection,
 } from "../overlay/selectionStore";
 import { isLiveProps, liveStore, type LiveProps } from "../inspector/liveStore";
+import { failRegion, previewRegion, reportOnce } from "../failures/regions";
+import { blockedHellos, takeFault } from "../failures/devFaults";
+
+/** A preview whose page hasn't said hello this long after loading (or leaving) has failed. */
+const CONNECT_TIMEOUT_MS = 10_000;
+const MAX_PAGE_ERRORS = 20;
 
 type AgentEnvelope = { source: "figr-agent"; session: string };
 
@@ -18,6 +24,8 @@ type AgentEnvelope = { source: "figr-agent"; session: string };
 type AgentMessage = AgentEnvelope &
   (
     | { type: "hello"; url: string }
+    | { type: "leaving" }
+    | { type: "pageError"; message: unknown }
     | { type: "zoom"; x: number; y: number; deltaY: number; deltaMode: number }
     | { type: "key"; key: string; shiftKey: boolean }
     | { type: "hover"; epoch: number; target: unknown }
@@ -80,6 +88,8 @@ type Peer = {
   hoverEpoch: number;
   /** Highest pick/navigate seq seen from the agent; echoed so it knows which ids it may forget. */
   agentSeq: number;
+  /** Running while waiting for a hello; firing fails the preview. */
+  connectTimer: number;
 };
 
 export type ShortcutHandler = (key: { key: string; shiftKey: boolean }) => void;
@@ -100,18 +110,65 @@ function setStatus(screenId: string, status: PeerStatus | null) {
   });
 }
 
+/** Uncaught errors reported by each preview's page, newest last. Cleared when the page reloads. */
+export const pageErrorStore = createStore<Record<string, string[]>>({});
+
 export function registerPreview(screenId: string, iframe: HTMLIFrameElement): () => void {
-  const peer: Peer = { screenId, iframe, session: null, url: null, hoverEpoch: 0, agentSeq: 0 };
+  const peer: Peer = {
+    screenId,
+    iframe,
+    session: null,
+    url: null,
+    hoverEpoch: 0,
+    agentSeq: 0,
+    connectTimer: 0,
+  };
   peers.set(screenId, peer);
   setStatus(screenId, "connecting");
+  startConnectTimer(peer);
   return () => {
+    window.clearTimeout(peer.connectTimer);
     if (peers.get(screenId) !== peer) return;
     peers.delete(screenId);
     setStatus(screenId, null);
     dropHoverFor(screenId);
     dropLiveFor(screenId);
+    dropPageErrorsFor(screenId);
     if (selectionStore.get().screenId === screenId) selectionStore.set(EMPTY_SELECTION);
   };
+}
+
+function startConnectTimer(peer: Peer) {
+  window.clearTimeout(peer.connectTimer);
+  peer.connectTimer = window.setTimeout(() => {
+    blockedHellos.delete(peer.screenId);
+    // A preview that was removed meanwhile has no region left to fail; failRegion ignores it.
+    failRegion(
+      previewRegion(peer.screenId),
+      new Error(`The page didn't respond within ${CONNECT_TIMEOUT_MS / 1000} seconds`),
+      { region: "preview", screenId: peer.screenId },
+      { title: "Couldn't connect to this preview" },
+    );
+  }, CONNECT_TIMEOUT_MS);
+}
+
+/** Dev only: reloads a preview and ignores its page's hello, so it fails to connect. */
+export function breakPreviewConnection(screenId: string) {
+  const peer = peers.get(screenId);
+  if (!peer) return;
+  blockedHellos.add(screenId);
+  peer.session = null;
+  setStatus(screenId, "connecting");
+  startConnectTimer(peer);
+  peer.iframe.src = peer.iframe.src;
+}
+
+function dropPageErrorsFor(screenId: string) {
+  pageErrorStore.set((prev) => {
+    if (!(screenId in prev)) return prev;
+    const { [screenId]: _dropped, ...rest } = prev;
+    return rest;
+  });
 }
 
 function dropHoverFor(screenId: string) {
@@ -154,8 +211,24 @@ function onMessage(event: MessageEvent) {
   const peer = findPeer(event.source);
   if (!peer) return;
   const msg = event.data;
+  // A throw while handling one preview's message fails only the region the message feeds.
+  try {
+    if (takeFault("message")) throw new Error("Dev: error while handling a message from a preview");
+    handleMessage(peer, msg);
+  } catch (error) {
+    if (TREE_MESSAGE_TYPES.has(msg.type)) {
+      failRegion("layers", error, { region: "layers", screenId: peer.screenId });
+    } else {
+      failRegion(previewRegion(peer.screenId), error, { region: "preview", screenId: peer.screenId });
+    }
+  }
+}
 
+function handleMessage(peer: Peer, msg: AgentMessage) {
   if (msg.type === "hello") {
+    if (blockedHellos.has(peer.screenId)) return;
+    window.clearTimeout(peer.connectTimer);
+    dropPageErrorsFor(peer.screenId);
     // A new session on a known iframe means the page navigated or reloaded.
     peer.session = msg.session;
     peer.url = msg.url;
@@ -175,6 +248,23 @@ function onMessage(event: MessageEvent) {
   }
 
   if (msg.session !== peer.session) return;
+
+  if (msg.type === "leaving") {
+    // The next page has CONNECT_TIMEOUT_MS to say hello, or this preview has failed.
+    setStatus(peer.screenId, "connecting");
+    startConnectTimer(peer);
+    return;
+  }
+
+  if (msg.type === "pageError") {
+    const message = typeof msg.message === "string" ? msg.message : "Unknown error";
+    pageErrorStore.set((prev) => ({
+      ...prev,
+      [peer.screenId]: [...(prev[peer.screenId] ?? []), message].slice(-MAX_PAGE_ERRORS),
+    }));
+    reportOnce(new Error(`Page error: ${message}`), { region: "preview", screenId: peer.screenId });
+    return;
+  }
 
   if (TREE_MESSAGE_TYPES.has(msg.type)) {
     const tree = msg as TreeMessage;

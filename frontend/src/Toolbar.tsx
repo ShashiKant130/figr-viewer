@@ -1,4 +1,5 @@
 import { cameraStore, fitToContent, zoomAtViewportCenter } from "./board/camera";
+import { DevMenu } from "./failures/DevMenu";
 import { useStore } from "./lib/store";
 import { modeStore, setMode, type Mode } from "./modes";
 
@@ -43,6 +44,7 @@ export function Toolbar() {
         <button type="button" onClick={fitToContent}>
           Fit
         </button>
+        {import.meta.env.DEV && <DevMenu />}
       </div>
     </header>
   );

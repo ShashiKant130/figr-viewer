@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchElementDetails, type ElementDetails } from "../api";
-import { report } from "../../report.js";
+import { devReloadStore, takeFault } from "../failures/devFaults";
+import { useRegionFail } from "../failures/Region";
+import { reportOnce } from "../failures/regions";
+import { useStore } from "../lib/store";
 
 export type DetailsState =
   | { status: "loading" }
@@ -9,7 +12,7 @@ export type DetailsState =
   | { status: "error"; message: string }
   | { status: "ready"; details: ElementDetails };
 
-type Result = { key: string; attempt: number; state: DetailsState };
+type Result = { key: string; attempt: number; reload: number; state: DetailsState };
 
 const LOADING: DetailsState = { status: "loading" };
 
@@ -21,6 +24,8 @@ const LOADING: DetailsState = { status: "loading" };
 export function useElementDetails(key: string | null, screenId: string | null) {
   const [attempt, setAttempt] = useState(0);
   const [result, setResult] = useState<Result | null>(null);
+  const devReload = useStore(devReloadStore, (s) => s.details);
+  const failRegion = useRegionFail();
   const screenIdRef = useRef(screenId);
   useEffect(() => {
     screenIdRef.current = screenId;
@@ -29,26 +34,32 @@ export function useElementDetails(key: string | null, screenId: string | null) {
   useEffect(() => {
     if (key === null) return;
     const controller = new AbortController();
+    const settle = (state: DetailsState) => setResult({ key, attempt, reload: devReload, state });
     fetchElementDetails(key, controller.signal).then(
       (details) => {
         if (controller.signal.aborted) return;
-        setResult({ key, attempt, state: details ? { status: "ready", details } : { status: "missing" } });
+        try {
+          if (takeFault("detailsResponse")) throw new Error("Dev: error while handling the Details response");
+          settle(details ? { status: "ready", details } : { status: "missing" });
+        } catch (error) {
+          failRegion(error);
+        }
       },
       (error: unknown) => {
         if (controller.signal.aborted) return;
-        report(error, { region: "details", screenId: screenIdRef.current, elementKey: key });
-        const message = error instanceof Error ? error.message : String(error);
-        setResult({ key, attempt, state: { status: "error", message } });
+        reportOnce(error, { region: "details", screenId: screenIdRef.current, elementKey: key });
+        settle({ status: "error", message: error instanceof Error ? error.message : String(error) });
       },
     );
     return () => controller.abort();
-  }, [key, attempt]);
+  }, [key, attempt, devReload, failRegion]);
 
   const retry = useCallback(() => setAttempt((n) => n + 1), []);
 
   let state: DetailsState | null = null;
   if (key !== null) {
-    state = result && result.key === key && result.attempt === attempt ? result.state : LOADING;
+    const current = result && result.key === key && result.attempt === attempt && result.reload === devReload;
+    state = current ? result.state : LOADING;
   }
   return { state, retry };
 }
