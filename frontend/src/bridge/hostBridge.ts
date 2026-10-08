@@ -1,28 +1,39 @@
 import { PAGES_ORIGIN, PREVIEW_WIDTH } from "../config";
 import { onCameraMotion, zoomAtClient } from "../board/camera";
-import { handleShortcut } from "../keyboard";
 import { createStore } from "../lib/store";
 import { wheelDeltaToPixels } from "../lib/dom";
 import { modeStore, type Mode } from "../modes";
 import { hoverStore, type PageRect } from "../overlay/hoverStore";
+import {
+  EMPTY_SELECTION,
+  selectionStore,
+  type SelectedElement,
+  type Selection,
+} from "../overlay/selectionStore";
+
+type AgentEnvelope = { source: "figr-agent"; session: string };
 
 // Messages exchanged with public/agent.js; see the protocol comment at the top of that file.
-type AgentMessage =
-  | { source: "figr-agent"; session: string; type: "hello"; url: string }
-  | { source: "figr-agent"; session: string; type: "zoom"; x: number; y: number; deltaY: number; deltaMode: number }
-  | { source: "figr-agent"; session: string; type: "key"; key: string; shiftKey: boolean }
-  | {
-      source: "figr-agent";
-      session: string;
-      type: "hover";
-      epoch: number;
-      target: { name: string; rect: PageRect } | null;
-    };
+type AgentMessage = AgentEnvelope &
+  (
+    | { type: "hello"; url: string }
+    | { type: "zoom"; x: number; y: number; deltaY: number; deltaMode: number }
+    | { type: "key"; key: string; shiftKey: boolean }
+    | { type: "hover"; epoch: number; target: { name: string; rect: PageRect } | null }
+    | { type: "pick"; seq: number; shiftKey: boolean; target: unknown }
+    | { type: "navigated"; seq: number; from: string; target: unknown }
+    | { type: "selectionRects"; rects: Record<string, unknown> }
+    | { type: "selectionRemoved"; ids: unknown[] }
+  );
+
+export type NavigateDirection = "firstChild" | "parent" | "next" | "prev";
 
 type HostMessage =
   | { type: "init"; mode: Mode; hoverEpoch: number }
   | { type: "mode"; mode: Mode }
-  | { type: "clearHover"; epoch: number };
+  | { type: "clearHover"; epoch: number }
+  | { type: "selection"; ids: string[]; seq: number }
+  | { type: "navigate"; from: string; direction: NavigateDirection };
 
 type Peer = {
   screenId: string;
@@ -32,7 +43,11 @@ type Peer = {
   url: string | null;
   /** Bumped on every host-side hover clear; hover messages stamped with an older epoch are stale. */
   hoverEpoch: number;
+  /** Highest pick/navigate seq seen from the agent; echoed so it knows which ids it may forget. */
+  agentSeq: number;
 };
+
+export type ShortcutHandler = (key: { key: string; shiftKey: boolean }) => void;
 
 export type PeerStatus = "connecting" | "connected";
 
@@ -51,7 +66,7 @@ function setStatus(screenId: string, status: PeerStatus | null) {
 }
 
 export function registerPreview(screenId: string, iframe: HTMLIFrameElement): () => void {
-  const peer: Peer = { screenId, iframe, session: null, url: null, hoverEpoch: 0 };
+  const peer: Peer = { screenId, iframe, session: null, url: null, hoverEpoch: 0, agentSeq: 0 };
   peers.set(screenId, peer);
   setStatus(screenId, "connecting");
   return () => {
@@ -59,6 +74,7 @@ export function registerPreview(screenId: string, iframe: HTMLIFrameElement): ()
     peers.delete(screenId);
     setStatus(screenId, null);
     dropHoverFor(screenId);
+    if (selectionStore.get().screenId === screenId) selectionStore.set(EMPTY_SELECTION);
   };
 }
 
@@ -107,7 +123,14 @@ function onMessage(event: MessageEvent) {
     // A new session on a known iframe means the page navigated or reloaded.
     peer.session = msg.session;
     peer.url = msg.url;
+    peer.agentSeq = 0;
     dropHoverFor(peer.screenId);
+    // Ids from the previous page mean nothing to the new one; the preview stays active.
+    selectionStore.set((prev) =>
+      prev.screenId === peer.screenId && (prev.ids.length > 0 || prev.lost)
+        ? { ...EMPTY_SELECTION, screenId: peer.screenId }
+        : prev,
+    );
     post(peer, { type: "init", mode: modeStore.get(), hoverEpoch: peer.hoverEpoch });
     setStatus(peer.screenId, "connected");
     return;
@@ -124,10 +147,22 @@ function onMessage(event: MessageEvent) {
       break;
     }
     case "key":
-      handleShortcut({ key: msg.key, shiftKey: msg.shiftKey });
+      if (typeof msg.key === "string") onKey?.({ key: msg.key, shiftKey: msg.shiftKey === true });
       break;
     case "hover":
       onHover(peer, msg.epoch, msg.target);
+      break;
+    case "pick":
+      onPick(peer, msg.seq, msg.shiftKey === true, msg.target);
+      break;
+    case "navigated":
+      onNavigated(peer, msg.seq, msg.from, msg.target);
+      break;
+    case "selectionRects":
+      onSelectionRects(peer, msg.rects);
+      break;
+    case "selectionRemoved":
+      if (Array.isArray(msg.ids)) onSelectionRemoved(peer, msg.ids);
       break;
   }
 }
@@ -149,10 +184,125 @@ function onHover(peer: Peer, epoch: number, target: { name: string; rect: PageRe
   hoverStore.set({ screenId: peer.screenId, name: target.name, rect: target.rect });
 }
 
+// ---- Selection ---------------------------------------------------------------
+
+function parseTarget(value: unknown): SelectedElement | null {
+  if (typeof value !== "object" || value === null) return null;
+  const t = value as Record<string, unknown>;
+  if (typeof t.id !== "string" || typeof t.name !== "string" || !isPageRect(t.rect)) return null;
+  return { id: t.id, name: t.name, rect: t.rect };
+}
+
+function noteSeq(peer: Peer, seq: unknown) {
+  if (typeof seq === "number" && seq > peer.agentSeq) peer.agentSeq = seq;
+}
+
+/** Replaces the selection and tells the affected pages which of their ids are still selected. */
+function setSelection(next: Selection) {
+  const prev = selectionStore.get();
+  selectionStore.set(next);
+  const notify = new Set([prev.screenId, next.screenId]);
+  for (const screenId of notify) {
+    const peer = screenId ? peers.get(screenId) : undefined;
+    if (!peer?.session) continue;
+    const ids = next.screenId === screenId ? next.ids : [];
+    post(peer, { type: "selection", ids, seq: peer.agentSeq });
+  }
+}
+
+function selectOnly(screenId: string, element: SelectedElement): Selection {
+  return { screenId, ids: [element.id], elements: { [element.id]: element }, lost: false };
+}
+
+function onPick(peer: Peer, seq: number, shiftKey: boolean, rawTarget: unknown) {
+  noteSeq(peer, seq);
+  if (modeStore.get() !== "select") return;
+  const prev = selectionStore.get();
+  const target = parseTarget(rawTarget);
+
+  if (!target) {
+    setSelection({ ...EMPTY_SELECTION, screenId: peer.screenId });
+    return;
+  }
+  if (!shiftKey || prev.screenId !== peer.screenId) {
+    setSelection(selectOnly(peer.screenId, target));
+    return;
+  }
+  if (prev.ids.includes(target.id)) {
+    const { [target.id]: _removed, ...elements } = prev.elements;
+    setSelection({ ...prev, ids: prev.ids.filter((id) => id !== target.id), elements, lost: false });
+  } else {
+    setSelection({
+      ...prev,
+      ids: [...prev.ids, target.id],
+      elements: { ...prev.elements, [target.id]: target },
+      lost: false,
+    });
+  }
+}
+
+function onNavigated(peer: Peer, seq: number, from: unknown, rawTarget: unknown) {
+  noteSeq(peer, seq);
+  const prev = selectionStore.get();
+  // Stale if the selection changed while the page was answering.
+  if (prev.screenId !== peer.screenId || prev.ids[prev.ids.length - 1] !== from) {
+    setSelection(prev);
+    return;
+  }
+  const target = parseTarget(rawTarget);
+  setSelection(target ? selectOnly(peer.screenId, target) : prev);
+}
+
+function onSelectionRects(peer: Peer, rects: Record<string, unknown>) {
+  if (typeof rects !== "object" || rects === null) return;
+  selectionStore.set((prev) => {
+    if (prev.screenId !== peer.screenId) return prev;
+    let elements: Record<string, SelectedElement> | null = null;
+    for (const [id, rect] of Object.entries(rects)) {
+      const current = prev.elements[id];
+      if (!current || !isPageRect(rect)) continue;
+      elements ??= { ...prev.elements };
+      elements[id] = { ...current, rect };
+    }
+    return elements ? { ...prev, elements } : prev;
+  });
+}
+
+function onSelectionRemoved(peer: Peer, ids: unknown[]) {
+  const prev = selectionStore.get();
+  if (prev.screenId !== peer.screenId) return;
+  const gone = new Set(ids.filter((id): id is string => typeof id === "string"));
+  const remaining = prev.ids.filter((id) => !gone.has(id));
+  if (remaining.length === prev.ids.length) return;
+  const elements: Record<string, SelectedElement> = {};
+  for (const id of remaining) elements[id] = prev.elements[id];
+  setSelection({ ...prev, ids: remaining, elements, lost: remaining.length === 0 });
+}
+
+/** Returns false when there was nothing to clear. */
+export function clearSelection(): boolean {
+  const prev = selectionStore.get();
+  if (prev.ids.length === 0 && !prev.lost) return false;
+  setSelection({ ...EMPTY_SELECTION, screenId: prev.screenId });
+  return true;
+}
+
+/** Asks the page to move from the most recently selected element. False if nothing is selected. */
+export function navigateSelection(direction: NavigateDirection): boolean {
+  const { screenId, ids } = selectionStore.get();
+  const peer = screenId ? peers.get(screenId) : undefined;
+  const from = ids[ids.length - 1];
+  if (!peer?.session || !from) return false;
+  post(peer, { type: "navigate", from, direction });
+  return true;
+}
+
+let onKey: ShortcutHandler | null = null;
 let installed = false;
-export function installHostBridge() {
+export function installHostBridge(options: { onKey: ShortcutHandler }) {
   if (installed) return;
   installed = true;
+  onKey = options.onKey;
   window.addEventListener("message", onMessage);
   modeStore.subscribe(() => {
     const mode = modeStore.get();

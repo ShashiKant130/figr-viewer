@@ -2,10 +2,10 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { installHostBridge } from "./bridge/hostBridge";
-import { installHostShortcuts } from "./keyboard";
+import { handleShortcut, installHostShortcuts } from "./keyboard";
 import "./styles.css";
 
-installHostBridge();
+installHostBridge({ onKey: handleShortcut });
 installHostShortcuts();
 
 // Ctrl/Cmd + wheel must never zoom the browser tab, even over the toolbar or panels.

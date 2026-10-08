@@ -8,6 +8,7 @@
   --accent-soft: rgba(109, 140, 255, 0.16);
   --danger: #ff6b6b;
   --hover: #0d99ff;
+  --selected: #f24e1e;
   --toolbar-h: 48px;
   --panel-w: 272px;
   color-scheme: dark;
@@ -160,6 +161,16 @@ kbd {
   color: var(--text-muted);
 }
 
+.inspector-list {
+  margin: 0;
+  padding: 10px 14px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-wrap: anywhere;
+}
+
 /* ---- Board ---- */
 
 .board {
@@ -253,6 +264,10 @@ kbd {
   box-shadow: inset 0 0 0 1px var(--hover);
 }
 
+.overlay-box--selected {
+  box-shadow: inset 0 0 0 2px var(--selected);
+}
+
 .overlay-label {
   position: absolute;
   display: flex;
@@ -271,6 +286,10 @@ kbd {
 
 .overlay-label--hover {
   background: var(--hover);
+}
+
+.overlay-label--selected {
+  background: var(--selected);
 }
 
 .board-message {

@@ -4,28 +4,63 @@ import type { Slot } from "../board/layout";
 import { useStore } from "../lib/store";
 import { modeStore } from "../modes";
 import { hoverStore, type PageRect } from "./hoverStore";
+import { selectionStore } from "./selectionStore";
 
 type Props = { slots: ReadonlyMap<string, Slot> };
 
 /**
- * Drawn in screen space on top of the scaled world, so outlines stay 1px and labels keep their
- * size at any zoom. Each preview gets a clip box matching its frame on screen.
+ * Drawn in screen space on top of the scaled world, so outlines keep their thickness and labels
+ * keep their size at any zoom. Each preview gets a clip box matching its frame on screen.
  */
 export function Overlay({ slots }: Props) {
   const camera = useStore(cameraStore);
   const mode = useStore(modeStore);
   const hover = useStore(hoverStore);
+  const selection = useStore(selectionStore);
 
-  if (mode !== "select" || !hover) return null;
-  const slot = slots.get(hover.screenId);
-  if (!slot) return null;
+  if (mode !== "select") return null;
+
+  const selectionSlot = selection.screenId ? slots.get(selection.screenId) : undefined;
+  const selected = selectionSlot ? selection.ids.map((id) => selection.elements[id]) : [];
+  const hoverSlot = hover ? slots.get(hover.screenId) : undefined;
+  // The selection outline already marks this element; a second outline would only add noise.
+  const hoverIsSelected =
+    hover !== null &&
+    hover.screenId === selection.screenId &&
+    selected.some((el) => el.name === hover.name && sameRect(el.rect, hover.rect));
+
+  if (selected.length === 0 && (!hover || !hoverSlot || hoverIsSelected)) return null;
 
   return (
     <div className="overlay" aria-hidden>
-      <PreviewClip slot={slot} camera={camera}>
-        <ElementBox rect={hover.rect} name={hover.name} zoom={camera.zoom} variant="hover" />
-      </PreviewClip>
+      {selectionSlot && selected.length > 0 && (
+        <PreviewClip slot={selectionSlot} camera={camera}>
+          {selected.map((el) => (
+            <ElementBox
+              key={el.id}
+              rect={el.rect}
+              name={el.name}
+              zoom={camera.zoom}
+              variant="selected"
+            />
+          ))}
+        </PreviewClip>
+      )}
+      {hover && hoverSlot && !hoverIsSelected && (
+        <PreviewClip slot={hoverSlot} camera={camera}>
+          <ElementBox rect={hover.rect} name={hover.name} zoom={camera.zoom} variant="hover" />
+        </PreviewClip>
+      )}
     </div>
+  );
+}
+
+function sameRect(a: PageRect, b: PageRect) {
+  return (
+    Math.abs(a.x - b.x) < 0.5 &&
+    Math.abs(a.y - b.y) < 0.5 &&
+    Math.abs(a.width - b.width) < 0.5 &&
+    Math.abs(a.height - b.height) < 0.5
   );
 }
 

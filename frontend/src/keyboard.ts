@@ -1,5 +1,6 @@
+import { clearSelection, navigateSelection } from "./bridge/hostBridge";
 import { isEditableTarget } from "./lib/dom";
-import { setMode } from "./modes";
+import { modeStore, setMode } from "./modes";
 
 export type ShortcutKey = {
   key: string;
@@ -15,13 +16,24 @@ export type ShortcutKey = {
  */
 export function handleShortcut(k: ShortcutKey): boolean {
   if (k.ctrlKey || k.metaKey || k.altKey) return false;
-  switch (k.key.toLowerCase()) {
+  const key = k.key.toLowerCase();
+  switch (key) {
     case "v":
       setMode("select");
       return true;
     case "i":
       setMode("interact");
       return true;
+  }
+  // The selection is hidden in Interact mode, so it can't be cleared or moved there.
+  if (modeStore.get() !== "select") return false;
+  switch (key) {
+    case "escape":
+      return clearSelection();
+    case "enter":
+      return navigateSelection(k.shiftKey ? "parent" : "firstChild");
+    case "tab":
+      return navigateSelection(k.shiftKey ? "prev" : "next");
     default:
       return false;
   }
@@ -33,6 +45,8 @@ export function installHostShortcuts() {
   installed = true;
   window.addEventListener("keydown", (event) => {
     if (event.defaultPrevented || event.isComposing || isEditableTarget(event.target)) return;
+    // Enter on a focused toolbar button should press it.
+    if (event.key === "Enter" && (event.target as Element | null)?.closest?.("button, a")) return;
     if (handleShortcut(event)) event.preventDefault();
   });
 }

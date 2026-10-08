@@ -6,12 +6,21 @@
 //   zoom    { x, y, deltaY, deltaMode }     Ctrl/Cmd + wheel over the page
 //   key     { key, shiftKey }               a host shortcut pressed while the page had focus
 //   hover   { epoch, target }               target: { name, rect } in page viewport px, or null
+//   pick    { seq, shiftKey, target }       a click in Select mode; target: { id, name, rect } or
+//                                           null for the page background
+//   navigated { seq, from, target }         answer to "navigate"; target null means no move
+//   selectionRects   { rects }              { [id]: rect } for selected elements that moved
+//   selectionRemoved { ids }                selected elements that no longer exist
 //
 // host -> agent  { source: "figr-host", type, ...payload }
 //   init        { mode, hoverEpoch }
 //   mode        { mode }                    "select" | "interact"
 //   clearHover  { epoch }                   the host dropped the hover (pan, zoom, mode change);
 //                                           stay quiet until the pointer moves again
+//   selection   { ids, seq }                the host's selection in this page, as of agent seq
+//   navigate    { from, direction }         "firstChild" | "parent" | "next" | "prev"
+//
+// Element ids are only meaningful within one session (one page load).
 (() => {
   if (window.parent === window) return;
   const script = document.currentScript;
@@ -56,6 +65,14 @@
         if (typeof msg.epoch === "number") hoverEpoch = msg.epoch;
         suppressHover();
         break;
+      case "selection":
+        if (Array.isArray(msg.ids) && typeof msg.seq === "number") {
+          syncSelection(msg.ids.filter((id) => typeof id === "string"), msg.seq);
+        }
+        break;
+      case "navigate":
+        if (typeof msg.from === "string") navigateFrom(msg.from, msg.direction);
+        break;
     }
   });
 
@@ -85,6 +102,19 @@
     const active = document.activeElement;
     if (active && active !== document.body && typeof active.blur === "function") active.blur();
   }
+
+  // Pointer events still fire on disabled controls, unlike click. Registered before the blockers
+  // below, which stop propagation to later listeners.
+  window.addEventListener(
+    "pointerdown",
+    (event) => {
+      if (mode !== "select" || !connected || event.button !== 0 || !event.isPrimary) return;
+      const el = elementAt(event.clientX, event.clientY);
+      pickSeq++;
+      send("pick", { seq: pickSeq, shiftKey: event.shiftKey, target: el && track(el) });
+    },
+    true,
+  );
 
   // Registered on window in the capture phase from <head>, so these run before any page handler.
   const BLOCKED_IN_SELECT = [
@@ -280,4 +310,225 @@
     },
     true,
   );
+
+  // ---- Selection -----------------------------------------------------------
+  // The host owns the selection; the agent keeps the selected elements behind opaque ids,
+  // reports their boxes whenever they change and reports when they stop existing.
+  //
+  // When the page replaces a selected node (e.g. an innerHTML rebuild), the agent looks for
+  // its successor using a description recorded at selection time: the nearest element with a
+  // unique data-key or id, then a path of steps from it that were each unique among their
+  // siblings. Anything that can't be found unambiguously is dropped, so the selection never
+  // moves to a different element; unkeyed rows in a rebuilt list are dropped this way.
+
+  const NON_LAYER_TAGS = new Set([
+    "SCRIPT",
+    "STYLE",
+    "TEMPLATE",
+    "NOSCRIPT",
+    "LINK",
+    "META",
+    "TITLE",
+    "BASE",
+    "HEAD",
+  ]);
+
+  const tracked = new Map(); // id -> { el, desc, touched, rect }
+  const idOf = new WeakMap(); // element -> id
+  let nextId = 0;
+  let pickSeq = 0;
+  let selectionRaf = 0;
+
+  function isLayer(el) {
+    return el.nodeType === 1 && !NON_LAYER_TAGS.has(el.tagName);
+  }
+
+  function layerChildren(el) {
+    return Array.from(el.children).filter(isLayer);
+  }
+
+  function isRoot(el) {
+    return el === document.body || el === document.documentElement;
+  }
+
+  function rectOf(el) {
+    const r = el.getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height };
+  }
+
+  function sameRect(a, b) {
+    return (
+      Math.abs(a.x - b.x) < 0.01 &&
+      Math.abs(a.y - b.y) < 0.01 &&
+      Math.abs(a.width - b.width) < 0.01 &&
+      Math.abs(a.height - b.height) < 0.01
+    );
+  }
+
+  function keyAttrOf(el) {
+    const key = el.getAttribute("data-key");
+    if (key) return { attr: "data-key", value: key };
+    if (el.id) return { attr: "id", value: el.id };
+    return null;
+  }
+
+  function findByAttr({ attr, value }) {
+    const matches = document.querySelectorAll(`[${attr}="${CSS.escape(value)}"]`);
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  function signatureOf(el) {
+    return [
+      el.tagName,
+      el.getAttribute("data-key") || "",
+      el.getAttribute("data-name") || "",
+      Array.from(el.classList).sort().join(" "),
+    ].join("|");
+  }
+
+  function uniqueChildWith(parent, signature) {
+    let found = null;
+    for (const child of parent.children) {
+      if (signatureOf(child) !== signature) continue;
+      if (found) return null;
+      found = child;
+    }
+    return found;
+  }
+
+  /** How to find this element again after the page rebuilds it, or null if that's unsafe. */
+  function describe(el) {
+    const steps = [];
+    let node = el;
+    while (!isRoot(node)) {
+      const key = keyAttrOf(node);
+      if (key && findByAttr(key) === node) return { anchor: key, steps: steps.reverse() };
+      const parent = node.parentElement;
+      if (!parent) return null;
+      const signature = signatureOf(node);
+      if (uniqueChildWith(parent, signature) !== node) return null;
+      steps.push(signature);
+      node = parent;
+    }
+    return { anchor: null, steps: steps.reverse() };
+  }
+
+  function refind(desc) {
+    if (!desc) return null;
+    let node = desc.anchor ? findByAttr(desc.anchor) : document.body;
+    for (const signature of desc.steps) {
+      if (!node) return null;
+      node = uniqueChildWith(node, signature);
+    }
+    return node && !isRoot(node) ? node : null;
+  }
+
+  function track(el) {
+    let id = idOf.get(el);
+    let entry = id && tracked.get(id);
+    if (!entry || entry.el !== el) {
+      id = `e${++nextId}`;
+      entry = { el, desc: describe(el), touched: 0, rect: null };
+      tracked.set(id, entry);
+      idOf.set(el, id);
+    }
+    // Survives a host "selection" message that was sent before the host saw this pick.
+    entry.touched = pickSeq;
+    entry.rect = rectOf(el);
+    startSelectionLoop();
+    return { id, name: nameOf(el), rect: entry.rect };
+  }
+
+  function untrack(id) {
+    const entry = tracked.get(id);
+    if (!entry) return;
+    tracked.delete(id);
+    if (idOf.get(entry.el) === id) idOf.delete(entry.el);
+  }
+
+  function syncSelection(ids, seq) {
+    const keep = new Set(ids);
+    for (const [id, entry] of tracked) {
+      if (!keep.has(id) && entry.touched <= seq) untrack(id);
+    }
+    const missing = ids.filter((id) => !tracked.has(id));
+    if (missing.length > 0) send("selectionRemoved", { ids: missing });
+    if (tracked.size === 0) stopSelectionLoop();
+  }
+
+  function checkSelection() {
+    if (tracked.size === 0) return;
+    const removed = [];
+    const rects = {};
+    let moved = false;
+    for (const [id, entry] of tracked) {
+      if (!entry.el.isConnected) {
+        const successor = refind(entry.desc);
+        const owner = successor && idOf.get(successor);
+        if (!successor || (owner && owner !== id && tracked.has(owner))) {
+          untrack(id);
+          removed.push(id);
+          continue;
+        }
+        entry.el = successor;
+        idOf.set(successor, id);
+      }
+      const rect = rectOf(entry.el);
+      if (!entry.rect || !sameRect(entry.rect, rect)) {
+        entry.rect = rect;
+        rects[id] = rect;
+        moved = true;
+      }
+    }
+    if (removed.length > 0) send("selectionRemoved", { ids: removed });
+    if (moved) send("selectionRects", { rects });
+  }
+
+  // Every frame catches scroll, layout and size changes; frames are throttled while the preview
+  // is off-screen, so DOM mutations are also checked directly to report removals promptly.
+  function selectionTick() {
+    selectionRaf = 0;
+    if (tracked.size === 0) return;
+    checkSelection();
+    selectionRaf = requestAnimationFrame(selectionTick);
+  }
+
+  function startSelectionLoop() {
+    if (!selectionRaf && tracked.size > 0) selectionRaf = requestAnimationFrame(selectionTick);
+  }
+
+  function stopSelectionLoop() {
+    if (selectionRaf) cancelAnimationFrame(selectionRaf);
+    selectionRaf = 0;
+  }
+
+  new MutationObserver(checkSelection).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+  window.addEventListener("scroll", checkSelection, { capture: true, passive: true });
+
+  function navigateFrom(id, direction) {
+    checkSelection();
+    const entry = tracked.get(id);
+    let target = null;
+    if (entry) {
+      const el = entry.el;
+      const parent = el.parentElement;
+      if (direction === "firstChild") {
+        target = layerChildren(el)[0] || null;
+      } else if (direction === "parent") {
+        target = parent && !isRoot(parent) ? parent : null;
+      } else if ((direction === "next" || direction === "prev") && parent) {
+        const siblings = layerChildren(parent);
+        const index = siblings.indexOf(el);
+        if (index >= 0 && siblings.length > 1) {
+          const step = direction === "next" ? 1 : -1;
+          target = siblings[(index + step + siblings.length) % siblings.length];
+        }
+      }
+    }
+    pickSeq++;
+    send("navigated", { seq: pickSeq, from: id, target: target && track(target) });
+  }
 })();

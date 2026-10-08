@@ -1,4 +1,5 @@
 import { Board } from "./board/Board";
+import { Inspector } from "./inspector/Inspector";
 import { Toolbar } from "./Toolbar";
 
 export function App() {
@@ -11,10 +12,7 @@ export function App() {
           <div className="panel-empty">Click something in a preview</div>
         </aside>
         <Board />
-        <aside className="panel panel--inspector">
-          <div className="panel-header">Inspector</div>
-          <div className="panel-empty">Nothing selected</div>
-        </aside>
+        <Inspector />
       </div>
     </div>
   );

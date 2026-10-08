@@ -6,8 +6,10 @@ import {
   useState,
   type CSSProperties,
 } from "react";
+import { clearSelection } from "../bridge/hostBridge";
 import { useStore } from "../lib/store";
 import { wheelDeltaToPixels } from "../lib/dom";
+import { modeStore } from "../modes";
 import { Overlay } from "../overlay/Overlay";
 import {
   cameraStore,
@@ -22,6 +24,8 @@ import { Preview } from "./Preview";
 import { useScreens } from "./useScreens";
 
 const DOT_SPACING = 24;
+/** Screen px a press may move and still count as a click on empty board space. */
+const CLICK_SLOP = 4;
 
 export function Board() {
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -75,14 +79,28 @@ export function Board() {
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
-  const drag = useRef<{ pointerId: number; x: number; y: number } | null>(null);
+  const drag = useRef<{
+    pointerId: number;
+    button: number;
+    startX: number;
+    startY: number;
+    x: number;
+    y: number;
+  } | null>(null);
 
   const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0 && event.button !== 1) return;
     if ((event.target as HTMLElement).closest("button, a, input, [data-no-pan]")) return;
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
-    drag.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+    drag.current = {
+      pointerId: event.pointerId,
+      button: event.button,
+      startX: event.clientX,
+      startY: event.clientY,
+      x: event.clientX,
+      y: event.clientY,
+    };
     setPanning(true);
   };
 
@@ -95,9 +113,15 @@ export function Board() {
   };
 
   const endDrag = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (drag.current?.pointerId !== event.pointerId) return;
+    const d = drag.current;
+    if (d?.pointerId !== event.pointerId) return;
     drag.current = null;
     setPanning(false);
+    const wasClick =
+      event.type === "pointerup" &&
+      d.button === 0 &&
+      Math.hypot(event.clientX - d.startX, event.clientY - d.startY) < CLICK_SLOP;
+    if (wasClick && modeStore.get() === "select") clearSelection();
   };
 
   const dot = DOT_SPACING * camera.zoom;
