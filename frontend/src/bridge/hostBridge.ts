@@ -10,6 +10,7 @@ import {
   type SelectedElement,
   type Selection,
 } from "../overlay/selectionStore";
+import { isLiveProps, liveStore, type LiveProps } from "../inspector/liveStore";
 
 type AgentEnvelope = { source: "figr-agent"; session: string };
 
@@ -24,6 +25,7 @@ type AgentMessage = AgentEnvelope &
     | { type: "navigated"; seq: number; from: string; target: unknown }
     | { type: "selectionRects"; rects: Record<string, unknown> }
     | { type: "selectionRemoved"; ids: unknown[] }
+    | { type: "selectionProps"; props: Record<string, unknown> }
     | TreeMessage
   );
 
@@ -107,6 +109,7 @@ export function registerPreview(screenId: string, iframe: HTMLIFrameElement): ()
     peers.delete(screenId);
     setStatus(screenId, null);
     dropHoverFor(screenId);
+    dropLiveFor(screenId);
     if (selectionStore.get().screenId === screenId) selectionStore.set(EMPTY_SELECTION);
   };
 }
@@ -158,6 +161,7 @@ function onMessage(event: MessageEvent) {
     peer.url = msg.url;
     peer.agentSeq = 0;
     dropHoverFor(peer.screenId);
+    dropLiveFor(peer.screenId);
     // Ids from the previous page mean nothing to the new one; the preview stays active.
     selectionStore.set((prev) =>
       prev.screenId === peer.screenId && (prev.ids.length > 0 || prev.lost)
@@ -208,7 +212,35 @@ function onMessage(event: MessageEvent) {
     case "selectionRemoved":
       if (Array.isArray(msg.ids)) onSelectionRemoved(peer, msg.ids);
       break;
+    case "selectionProps":
+      onSelectionProps(peer, msg.props);
+      break;
   }
+}
+
+// ---- Live inspector values -------------------------------------------------------
+
+// Not filtered by the current selection: the agent sends an element's values just before the
+// pick that selects it.
+function onSelectionProps(peer: Peer, props: Record<string, unknown>) {
+  if (typeof props !== "object" || props === null) return;
+  const valid: Record<string, LiveProps> = {};
+  let any = false;
+  for (const [id, value] of Object.entries(props)) {
+    if (!isLiveProps(value)) continue;
+    valid[id] = value;
+    any = true;
+  }
+  if (!any) return;
+  liveStore.set((prev) => ({ ...prev, [peer.screenId]: { ...prev[peer.screenId], ...valid } }));
+}
+
+function dropLiveFor(screenId: string) {
+  liveStore.set((prev) => {
+    if (!(screenId in prev)) return prev;
+    const { [screenId]: _dropped, ...rest } = prev;
+    return rest;
+  });
 }
 
 function isPageRect(value: unknown): value is PageRect {

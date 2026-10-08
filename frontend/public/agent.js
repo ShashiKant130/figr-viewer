@@ -12,6 +12,9 @@
 //   navigated { seq, from, target }         answer to "navigate"; target null means no move
 //   selectionRects   { rects }              { [id]: rect } for selected elements that moved
 //   selectionRemoved { ids }                selected elements that no longer exist
+//   selectionProps   { props }              { [id]: live inspector values } for selected elements
+//                                           whose values changed (sent before the pick that
+//                                           selects them, so the host never waits on a frame)
 //   childrenResult { req, id, nodes }       nodes: [{ id, name, hasChildren }] or null
 //   revealResult   { req, id, path, lists } lists: { [parentId]: nodes } for every level of path
 //   searchResult   { req, nodes, matches, truncated }
@@ -434,9 +437,13 @@
     checkSelection();
   }
 
+  // Attribute and text changes don't touch the tree, but they can change inspector values; frames
+  // are throttled while the preview is off-screen, so mutations are the prompt signal.
   new MutationObserver(onMutations).observe(document.documentElement, {
     childList: true,
     subtree: true,
+    attributes: true,
+    characterData: true,
   });
 
   // ---- Layers tree -----------------------------------------------------------
@@ -654,7 +661,7 @@
   // The host owns the selection; the agent measures the selected elements, reports their boxes
   // whenever they change and reports when they stop existing (their id was dropped above).
 
-  const selected = new Map(); // id -> { touched, rect }
+  const selected = new Map(); // id -> { touched, rect, live } (live: last sent props, as JSON)
   let pickSeq = 0;
   let selectionRaf = 0;
 
@@ -662,12 +669,15 @@
     const id = idFor(el);
     let entry = selected.get(id);
     if (!entry) {
-      entry = { touched: 0, rect: null };
+      entry = { touched: 0, rect: null, live: null };
       selected.set(id, entry);
     }
     // Survives a host "selection" message that was sent before the host saw this pick.
     entry.touched = pickSeq;
     entry.rect = rectOf(el);
+    const props = liveProps(el);
+    entry.live = JSON.stringify(props);
+    send("selectionProps", { props: { [id]: props } });
     startSelectionLoop();
     return { id, name: nameOf(el), rect: entry.rect };
   }
@@ -686,7 +696,9 @@
     if (selected.size === 0) return;
     const removed = [];
     const rects = {};
+    const props = {};
     let moved = false;
+    let changed = false;
     for (const [id, entry] of selected) {
       const el = elOf(id);
       if (!el) {
@@ -700,9 +712,107 @@
         rects[id] = rect;
         moved = true;
       }
+      const live = liveProps(el);
+      const json = JSON.stringify(live);
+      if (json !== entry.live) {
+        entry.live = json;
+        props[id] = live;
+        changed = true;
+      }
     }
     if (removed.length > 0) send("selectionRemoved", { ids: removed });
     if (moved) send("selectionRects", { rects });
+    if (changed) send("selectionProps", { props });
+  }
+
+  // ---- Inspector (live values) -----------------------------------------------
+
+  const TEXT_LIMIT = 120;
+
+  function liveProps(el) {
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return {
+      name: nameOf(el),
+      tag: el.tagName.toLowerCase(),
+      elementId: el.id || "",
+      classes: Array.from(el.classList),
+      width: Math.round(r.width),
+      height: Math.round(r.height),
+      // Document coordinates: where the element sits in the page, whatever the page's scroll.
+      x: Math.round(r.left + window.scrollX),
+      y: Math.round(r.top + window.scrollY),
+      text: textOf(el),
+      color: formatColor(parseColor(style.color)),
+      background: seenBackground(el),
+      fontFamily: style.fontFamily,
+      fontSize: style.fontSize,
+      fontWeight: style.fontWeight,
+      key: el.getAttribute("data-key") || null,
+    };
+  }
+
+  // Stops once enough text is collected, so a huge container costs no more than a small one.
+  function textOf(el) {
+    let text = "";
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const parent = node.parentElement;
+      if (parent && NON_LAYER_TAGS.has(parent.tagName)) continue;
+      text = (text + node.data).replace(/\s+/g, " ");
+      if (text.trimStart().length > TEXT_LIMIT) break;
+    }
+    return text.trim().slice(0, TEXT_LIMIT);
+  }
+
+  // The colour actually seen behind the element: its own background blended over its ancestors'
+  // until one is opaque, then over the white canvas. Images, gradients and opacity are ignored.
+  function seenBackground(el) {
+    const layers = [];
+    for (let node = el; node; node = node.parentElement) {
+      const c = parseColor(getComputedStyle(node).backgroundColor);
+      if (c[3] > 0) layers.push(c);
+      if (c[3] >= 1) break;
+    }
+    let out = [255, 255, 255];
+    for (let i = layers.length - 1; i >= 0; i--) {
+      const [r, g, b, a] = layers[i];
+      out = [r * a + out[0] * (1 - a), g * a + out[1] * (1 - a), b * a + out[2] * (1 - a)];
+    }
+    return formatColor([out[0], out[1], out[2], 1]);
+  }
+
+  const RGB_PATTERN = /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)(?:[\s,/]+([\d.]+)(%?))?\s*\)$/;
+  const colorCache = new Map();
+  let colorCtx = null;
+
+  // Computed colours are usually rgb()/rgba(); anything else (oklch(), color(), ...) is resolved
+  // by painting it on a detached 1×1 canvas.
+  function parseColor(value) {
+    const cached = colorCache.get(value);
+    if (cached) return cached;
+    let rgba;
+    const m = RGB_PATTERN.exec(value);
+    if (m) {
+      const alpha = m[4] === undefined ? 1 : Number(m[4]) / (m[5] ? 100 : 1);
+      rgba = [Number(m[1]), Number(m[2]), Number(m[3]), alpha];
+    } else {
+      colorCtx ??= document.createElement("canvas").getContext("2d", { willReadFrequently: true });
+      colorCtx.clearRect(0, 0, 1, 1);
+      colorCtx.fillStyle = "rgba(0, 0, 0, 0)";
+      colorCtx.fillStyle = value;
+      colorCtx.fillRect(0, 0, 1, 1);
+      const d = colorCtx.getImageData(0, 0, 1, 1).data;
+      rgba = [d[0], d[1], d[2], d[3] / 255];
+    }
+    if (colorCache.size > 500) colorCache.clear();
+    colorCache.set(value, rgba);
+    return rgba;
+  }
+
+  function formatColor([r, g, b, a]) {
+    const hex = (n) => Math.round(Math.min(255, Math.max(0, n))).toString(16).padStart(2, "0");
+    return `#${hex(r)}${hex(g)}${hex(b)}${a < 1 ? hex(a * 255) : ""}`;
   }
 
   // Every frame catches scroll, layout and size changes; frames are throttled while the preview

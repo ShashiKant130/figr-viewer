@@ -48,6 +48,28 @@ function isScreen(value: unknown): value is Screen {
   }
 }
 
+export type ElementDetails = { component: string; description: string; status: string; owner: string };
+
+function isElementDetails(value: unknown): value is ElementDetails {
+  if (typeof value !== "object" || value === null) return false;
+  const d = value as Record<string, unknown>;
+  return [d.component, d.description, d.status, d.owner].every((v) => typeof v === "string");
+}
+
+/** Resolves to null when the API has no details for the key (404), which is not an error. */
+export async function fetchElementDetails(key: string, signal: AbortSignal): Promise<ElementDetails | null> {
+  const path = `/elements/${encodeURIComponent(key)}`;
+  let data: unknown;
+  try {
+    data = await getJson(path, signal);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+  if (!isElementDetails(data)) throw new ApiError(`GET ${path} returned unexpected data`, 200);
+  return data;
+}
+
 export async function fetchScreens(signal: AbortSignal): Promise<Screen[]> {
   const data = await getJson("/screens", signal);
   if (!Array.isArray(data) || !data.every(isScreen)) {
